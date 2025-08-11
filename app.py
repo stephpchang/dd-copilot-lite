@@ -1,6 +1,7 @@
 import os
 import requests
 import streamlit as st
+from openai import OpenAI
 
 # Google search helper
 def serp(q, num=6):
