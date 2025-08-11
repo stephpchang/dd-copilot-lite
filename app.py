@@ -29,9 +29,10 @@ def tidy(results, prefer=()):
     """Deduplicate, optionally prefer certain domains, and limit to top 3."""
     seen, cleaned = set(), []
     for item in results:
-        if item["url"] in seen:
+        url = item.get("url", "")
+        if not url or url in seen:
             continue
-        seen.add(item["url"])
+        seen.add(url)
         cleaned.append(item)
     if prefer:
         cleaned.sort(key=lambda x: any(p in x["url"] for p in prefer), reverse=True)
@@ -41,10 +42,12 @@ def tidy(results, prefer=()):
 def render_section(title, items, empty_hint):
     st.subheader(title)
     if not items:
-        st.write(empty_hint)
+        st.caption(empty_hint)
     else:
         for item in items:
             st.write(f"[{item['title']}]({item['url']}) — {item['snippet']}")
+
+# OpenAI investor summary
 def synthesize_snapshot(company_name, overview_items, team_items, market_items, competition_items):
     """Return a 5-bullet investor summary from the search snippets."""
     if not os.getenv("OPENAI_API_KEY"):
@@ -60,8 +63,8 @@ def synthesize_snapshot(company_name, overview_items, team_items, market_items, 
 You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5 concise bullets for {company_name}:
 - What they do (one line)
 - Founders / leadership (if known)
-- Market context (who/what/where)
-- Competitive positioning (key alternatives / differentiation if apparent)
+- Market context
+- Competitive positioning / key alternatives
 - 1–2 open diligence questions
 
 JSON context:
@@ -84,19 +87,37 @@ company = st.text_input("Enter company name or website")
 
 # Run
 if st.button("Run"):
-    if company.strip() == "":
+    name = company.strip()
+    if not name:
         st.warning("Please enter a company name.")
     else:
-        st.success(f"Profile for {company}")
+        st.success(f"Profile for {name}")
 
-        # Search queries
-        overview_results = tidy(serp(f"{company} company overview", num=5), prefer=("crunchbase.com", "linkedin.com"))
-        team_results = tidy(serp(f"{company} founding team", num=5), prefer=("linkedin.com",))
-        market_results = tidy(serp(f"{company} market size trends", num=5))
-        competition_results = tidy(serp(f"{company} competitors", num=5))
+        # Smarter queries + preferred sources
+        overview_results    = tidy(
+            serp(f"{name} official site", 8),
+            prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
+        )
+        team_results        = tidy(
+            serp(f"{name} founders team leadership", 8),
+            prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
+        )
+        market_results      = tidy(
+            serp(f"{name} target market TAM customers industry", 8),
+            prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
+        )
+        competition_results = tidy(
+            serp(f"{name} competitors alternatives comparative", 8),
+            prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
+        )
 
-        # Display results
-        render_section("Company Overview", overview_results, "No overview found.")
-        render_section("Founding Team", team_results, "No team info found.")
-        render_section("Market", market_results, "No market info found.")
-        render_section("Competition", competition_results, "No competition info found.")
+        # Investor Summary
+        st.subheader("Investor Summary")
+        summary = synthesize_snapshot(name, overview_results, team_results, market_results, competition_results)
+        st.write(summary)
+
+        # Sections
+        render_section("Company Overview", overview_results, "No overview found. Try pasting the official site.")
+        render_section("Founding Team",    team_results,     "No team info found. Try 'founders' or 'team'.")
+        render_section("Market",           market_results,   "No market info found. Try 'market size' or 'TAM'.")
+        render_section("Competition",      competition_results, "No competition info found. Try 'alternatives'.")
