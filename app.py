@@ -2,6 +2,8 @@ import os
 import requests
 import streamlit as st
 from openai import OpenAI
+import time
+import openai  # for catching RateLimitError
 
 # Google search helper
 def serp(q, num=6):
@@ -49,16 +51,29 @@ def render_section(title, items, empty_hint):
 
 # OpenAI investor summary
 def synthesize_snapshot(company_name, overview_items, team_items, market_items, competition_items):
-    """Return a 5-bullet investor summary from the search snippets."""
+    """Return a 5-bullet investor summary from the search snippets, with rate-limit handling."""
     if not os.getenv("OPENAI_API_KEY"):
         return "Set OPENAI_API_KEY to enable the investor summary."
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    # Trim context so we don't send huge prompts (helps avoid quota/timeouts)
+    def _trim(items, max_items=3, max_snip=240):
+        out = []
+        for it in items[:max_items]:
+            out.append({
+                "title": (it.get("title") or "")[:120],
+                "url": it.get("url") or "",
+                "snippet": (it.get("snippet") or "")[:max_snip]
+            })
+        return out
+
     context = {
-        "overview": overview_items,
-        "team": team_items,
-        "market": market_items,
-        "competition": competition_items
+        "overview": _trim(overview_items),
+        "team": _trim(team_items),
+        "market": _trim(market_items),
+        "competition": _trim(competition_items)
     }
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
 You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5 concise bullets for {company_name}:
 - What they do (one line)
@@ -70,12 +85,22 @@ You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5
 JSON context:
 {context}
 """
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.2
-    )
-    return resp.choices[0].message.content.strip()
+
+    # Minimal retry/backoff for rate limits
+    for attempt in range(2):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except openai.RateLimitError:
+            time.sleep(1.5)  # brief backoff, then try again
+        except Exception as e:
+            return f"(Investor Summary unavailable: {e})"
+
+    return "(Investor Summary temporarily unavailable due to rate limits. Please try again.)"
 
 # Streamlit app setup
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
@@ -110,6 +135,13 @@ if st.button("Run"):
             serp(f"{name} competitors alternatives comparative", 8),
             prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
         )
+        # Optional: only generate summary when asked
+generate_summary = st.checkbox("Generate Investor Summary", value=True)
+
+if generate_summary:
+    st.subheader("Investor Summary")
+    summary = synthesize_snapshot(name, overview_results, team_results, market_results, competition_results)
+    st.write(summary)
 
         # Investor Summary
         st.subheader("Investor Summary")
