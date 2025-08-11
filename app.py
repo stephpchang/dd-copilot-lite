@@ -63,11 +63,26 @@ if st.button("Run"):
         st.success(f"Profile for {company}")
 
         # Search queries
-        overview_results = tidy(serp(f"{company} company overview", num=5), prefer=("wikipedia.org", "crunchbase.com"))
-        team_results = tidy(serp(f"{company} founding team", num=5), prefer=("linkedin.com", "crunchbase.com"))
-        market_results = tidy(serp(f"{company} market size trends", num=5))
-        competition_results = tidy(serp(f"{company} competitors", num=5))
+        # Smarter queries + preferred sources
+overview_results    = tidy(
+    serp(f"{company} official site", 8),
+    prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
+)
 
+team_results        = tidy(
+    serp(f"{company} founders team leadership", 8),
+    prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
+)
+
+market_results      = tidy(
+    serp(f"{company} target market TAM customers industry", 8),
+    prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
+)
+
+competition_results = tidy(
+    serp(f"{company} competitors alternatives comparative", 8),
+    prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
+)
         # Display results
         render_section("Company Overview", overview_results, "No overview found.")
         render_section("Founding Team", team_results, "No team info found.")
