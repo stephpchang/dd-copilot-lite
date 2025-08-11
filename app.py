@@ -78,4 +78,41 @@ def synthesize_snapshot(name, overview, team, market, competition):
     return resp.choices[0].message.content.strip()
 
 # Streamlit app setup
-st.set_page_config(page
+st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
+st.title("Due Diligence Co-Pilot (Lite)")
+st.write("Provides profiles of a company’s team, market, and competition to accelerate early-stage investment assessments.")
+
+# Input
+company = st.text_input("Enter company name or website")
+
+# Run
+if st.button("Run"):
+    if company.strip() == "":
+        st.warning("Please enter a company name.")
+    else:
+        st.success(f"Profile for {company}")
+
+        # Run searches & clean results
+        overview_results = dedupe_and_limit(serp(f"{company} company overview", num=5))
+        team_results = dedupe_and_limit(serp(f"{company} founding team", num=5))
+        market_results = dedupe_and_limit(serp(f"{company} market size trends", num=5))
+        competition_results = dedupe_and_limit(serp(f"{company} competitors", num=5))
+
+        # Display results
+        render_section("Company Overview", overview_results, "No overview found.")
+        render_section("Founding Team", team_results, "No team info found.")
+        render_section("Market", market_results, "No market info found.")
+        render_section("Competition", competition_results, "No competition info found.")
+
+        # Investor summary toggle
+        generate_summary = st.checkbox("Generate Investor Summary", value=True)
+        if generate_summary:
+            st.subheader("Investor Summary")
+            summary = synthesize_snapshot(
+                company,
+                overview_results,
+                team_results,
+                market_results,
+                competition_results
+            )
+            st.write(summary)
