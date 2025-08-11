@@ -45,6 +45,34 @@ def render_section(title, items, empty_hint):
     else:
         for item in items:
             st.write(f"[{item['title']}]({item['url']}) — {item['snippet']}")
+def synthesize_snapshot(company_name, overview_items, team_items, market_items, competition_items):
+    """Return a 5-bullet investor summary from the search snippets."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return "Set OPENAI_API_KEY to enable the investor summary."
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    context = {
+        "overview": overview_items,
+        "team": team_items,
+        "market": market_items,
+        "competition": competition_items
+    }
+    prompt = f"""
+You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5 concise bullets for {company_name}:
+- What they do (one line)
+- Founders / leadership (if known)
+- Market context (who/what/where)
+- Competitive positioning (key alternatives / differentiation if apparent)
+- 1–2 open diligence questions
+
+JSON context:
+{context}
+"""
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content.strip()
 
 # Streamlit app setup
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
