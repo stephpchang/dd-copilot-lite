@@ -7,8 +7,9 @@ import openai  # for catching RateLimitError
 from openai import OpenAI
 
 # -------------------------
-# Google search helper
+# Google search helper (now cached)
 # -------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
 def serp(q, num=6):
     cx = os.getenv("GOOGLE_CSE_ID")
     key = os.getenv("GOOGLE_API_KEY")
@@ -58,7 +59,7 @@ def render_section(title, items, empty_hint):
             st.write(f"{title} — {snip}")
 
 # -------------------------
-# OpenAI helpers (cached + safe)
+# OpenAI helpers (still optional; ignore if rate-limited)
 # -------------------------
 def _openai_client():
     return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -111,7 +112,6 @@ JSON context:
 
 @st.cache_data(show_spinner=False)
 def founder_brief(company_name, team_items):
-    """Return JSON: founders [{name, role|null, highlights[]}], sources[]."""
     if not os.getenv("OPENAI_API_KEY"):
         return {"founders": [], "sources": [], "note": "Set OPENAI_API_KEY for Founder Brief."}
     ctx = {"team": _trim(team_items, max_items=4)}
@@ -149,14 +149,13 @@ Snippets JSON:
 
 @st.cache_data(show_spinner=False)
 def market_map(company_name, competition_items):
-    """Return JSON: axes[], competitors[{name, why_similar, url|null}], sources[]."""
     if not os.getenv("OPENAI_API_KEY"):
         return {"axes": [], "competitors": [], "sources": [], "note": "Set OPENAI_API_KEY for Market Map."}
     ctx = {"competition": _trim(competition_items, max_items=6)}
     prompt = f"""
 From these competitor-related snippets for {company_name}, produce concise JSON:
 {{
-  "axes": [str],                # e.g., "enterprise vs SMB", "price vs model quality"
+  "axes": [str],
   "competitors": [
     {{"name": str, "why_similar": str, "url": str|null}}
   ],
@@ -204,20 +203,18 @@ if "gen_founder_brief" not in st.session_state:
 if "gen_market_map" not in st.session_state:
     st.session_state.gen_market_map = False
 
-# Example picker (helps testing)
 examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
 
-# Form to prevent rerun loops
 with st.form("search_form", clear_on_submit=False):
     company_input = st.text_input("Enter company name or website", value=st.session_state.company)
     example = st.selectbox("Or pick an example", examples, index=0)
     if example:
         company_input = example
 
-    # Toggles (optional to save quota)
-    gen_summary_input = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
-    gen_founder_input = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
-    gen_marketmap_input = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
+    # Keep AI toggles (you can ignore if rate-limited)
+    gen_summary_input    = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
+    gen_founder_input    = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
+    gen_marketmap_input  = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
 
     submitted = st.form_submit_button("Run")
 
@@ -257,16 +254,15 @@ if submitted and name:
             prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
         )
 
-    # Optional AI sections (cached, safe)
+    # (Optional) AI sections — will show rate-limit messages if quota hit
     if gen_summary:
         st.subheader("Investor Summary")
         st.write(synthesize_snapshot(name, overview_results, team_results, market_results, competition_results))
-    else:
-        st.caption("Tip: check the boxes in the form to generate AI summaries (uses your OpenAI quota).")
 
     if gen_founder:
         st.subheader("Founder Brief")
         st.json(founder_brief(name, team_results))
+
     if gen_mmap:
         st.subheader("Market Map")
         st.json(market_map(name, competition_results))
@@ -276,3 +272,27 @@ if submitted and name:
     render_section("Founding Team",    team_results,     "No team info found. Try 'founders' or 'team'.")
     render_section("Market",           market_results,   "No market info found. Try 'market size' or 'TAM'.")
     render_section("Competition",      competition_results, "No competition info found. Try 'alternatives'.")
+
+    # -------------------------
+    # NEW: Markdown export (no AI required)
+    # -------------------------
+    import datetime as dt
+    def md_list(items):
+        return "\n".join([f"- [{i['title']}]({i['url']}) — {i['snippet']}" for i in items]) or "_No items_"
+
+    md = f"""# {name} — First-Pass Diligence
+_Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_
+
+## Overview
+{md_list(overview_results)}
+
+## Founding Team
+{md_list(team_results)}
+
+## Market
+{md_list(market_results)}
+
+## Competition
+{md_list(competition_results)}
+"""
+    st.download_button("Download snapshot (Markdown)", md, file_name=f"{name}_snapshot.md")
