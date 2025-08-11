@@ -31,6 +31,7 @@ def serp(q, num=6):
 # Result cleanup + rendering
 # -------------------------
 def tidy(results, prefer=(), limit=3):
+    """Deduplicate by URL, optionally prefer domains, return top N."""
     seen, cleaned = set(), []
     for r in results or []:
         url = r.get("url") or ""
@@ -57,31 +58,31 @@ def render_section(title, items, empty_hint):
             st.write(f"{title} — {snip}")
 
 # -------------------------
-# OpenAI: Investor Summary (cached + safe)
+# OpenAI helpers (cached + safe)
 # -------------------------
+def _openai_client():
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def _trim(items, max_items=3, max_snip=220):
+    out = []
+    for it in (items or [])[:max_items]:
+        out.append({
+            "title": (it.get("title") or "")[:100],
+            "url": it.get("url") or "",
+            "snippet": (it.get("snippet") or "")[:max_snip],
+        })
+    return out
+
 @st.cache_data(show_spinner=False)
 def synthesize_snapshot(company_name, overview_items, team_items, market_items, competition_items):
     if not os.getenv("OPENAI_API_KEY"):
         return "Set OPENAI_API_KEY to enable the investor summary."
-
-    def _trim(items, max_items=3, max_snip=220):
-        out = []
-        for it in (items or [])[:max_items]:
-            out.append({
-                "title": (it.get("title") or "")[:100],
-                "url": it.get("url") or "",
-                "snippet": (it.get("snippet") or "")[:max_snip],
-            })
-        return out
-
     context = {
         "overview": _trim(overview_items),
         "team": _trim(team_items),
         "market": _trim(market_items),
         "competition": _trim(competition_items),
     }
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     prompt = f"""
 You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5 concise bullets for {company_name}:
 - What they do (one line)
@@ -93,8 +94,8 @@ You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5
 JSON context:
 {json.dumps(context, ensure_ascii=False)}
 """
-
-    for _ in range(2):  # 2 tries
+    client = _openai_client()
+    for _ in range(2):
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -108,6 +109,83 @@ JSON context:
             return f"(Investor Summary unavailable: {e})"
     return "(Investor Summary temporarily unavailable due to rate limits. Try again shortly.)"
 
+@st.cache_data(show_spinner=False)
+def founder_brief(company_name, team_items):
+    """Return JSON: founders [{name, role|null, highlights[]}], sources[]."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return {"founders": [], "sources": [], "note": "Set OPENAI_API_KEY for Founder Brief."}
+    ctx = {"team": _trim(team_items, max_items=4)}
+    prompt = f"""
+From these search snippets about the team of {company_name}, extract concise JSON:
+{{
+  "founders":[
+    {{"name": str, "role": str|null, "highlights": [str]}}
+  ],
+  "sources":[str]
+}}
+Only include what is supported by the snippets. If unknown, omit the field.
+
+Snippets JSON:
+{json.dumps(ctx, ensure_ascii=False)}
+"""
+    client = _openai_client()
+    for _ in range(2):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                temperature=0,
+            )
+            txt = resp.choices[0].message.content.strip().strip("`")
+            try:
+                return json.loads(txt)
+            except Exception:
+                return {"founders": [], "sources": [], "note": txt[:500]}
+        except openai.RateLimitError:
+            time.sleep(1.5)
+        except Exception as e:
+            return {"founders": [], "sources": [], "note": f"Unavailable: {e}"}
+    return {"founders": [], "sources": [], "note": "Rate limited. Try again shortly."}
+
+@st.cache_data(show_spinner=False)
+def market_map(company_name, competition_items):
+    """Return JSON: axes[], competitors[{name, why_similar, url|null}], sources[]."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return {"axes": [], "competitors": [], "sources": [], "note": "Set OPENAI_API_KEY for Market Map."}
+    ctx = {"competition": _trim(competition_items, max_items=6)}
+    prompt = f"""
+From these competitor-related snippets for {company_name}, produce concise JSON:
+{{
+  "axes": [str],                # e.g., "enterprise vs SMB", "price vs model quality"
+  "competitors": [
+    {{"name": str, "why_similar": str, "url": str|null}}
+  ],
+  "sources":[str]
+}}
+Keep it brief (3–6 competitors). Use only what appears in the snippets.
+
+Snippets JSON:
+{json.dumps(ctx, ensure_ascii=False)}
+"""
+    client = _openai_client()
+    for _ in range(2):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                temperature=0,
+            )
+            txt = resp.choices[0].message.content.strip().strip("`")
+            try:
+                return json.loads(txt)
+            except Exception:
+                return {"axes": [], "competitors": [], "sources": [], "note": txt[:500]}
+        except openai.RateLimitError:
+            time.sleep(1.5)
+        except Exception as e:
+            return {"axes": [], "competitors": [], "sources": [], "note": f"Unavailable: {e}"}
+    return {"axes": [], "competitors": [], "sources": [], "note": "Rate limited. Try again shortly."}
+
 # -------------------------
 # Streamlit app
 # -------------------------
@@ -116,26 +194,44 @@ st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
 st.write("Provides profiles of a company’s team, market, and competition to accelerate early-stage investment assessments.")
 
-# Persistent defaults
+# Persist inputs
 if "company" not in st.session_state:
     st.session_state.company = ""
 if "gen_summary" not in st.session_state:
     st.session_state.gen_summary = False
+if "gen_founder_brief" not in st.session_state:
+    st.session_state.gen_founder_brief = False
+if "gen_market_map" not in st.session_state:
+    st.session_state.gen_market_map = False
 
-# Use a form so widgets don't rerun the whole app on each change
+# Example picker (helps testing)
+examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
+
+# Form to prevent rerun loops
 with st.form("search_form", clear_on_submit=False):
     company_input = st.text_input("Enter company name or website", value=st.session_state.company)
+    example = st.selectbox("Or pick an example", examples, index=0)
+    if example:
+        company_input = example
+
+    # Toggles (optional to save quota)
     gen_summary_input = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
+    gen_founder_input = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
+    gen_marketmap_input = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
+
     submitted = st.form_submit_button("Run")
 
-# Only update state when the form is submitted
+# Update state only on submit
 if submitted:
-    st.session_state.company = company_input.strip()
+    st.session_state.company = (company_input or "").strip()
     st.session_state.gen_summary = gen_summary_input
+    st.session_state.gen_founder_brief = gen_founder_input
+    st.session_state.gen_market_map = gen_marketmap_input
 
-# Use the persisted values
 name = st.session_state.company
 gen_summary = st.session_state.gen_summary
+gen_founder = st.session_state.gen_founder_brief
+gen_mmap = st.session_state.gen_market_map
 
 if submitted and not name:
     st.warning("Please enter a company name.")
@@ -143,33 +239,39 @@ if submitted and not name:
 if submitted and name:
     st.success(f"Profile for {name}")
 
-    # Searches (smarter queries + preferred domains)
-    overview_results = tidy(
-        serp(f"{name} official site"),
-        prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
-    )
-    team_results = tidy(
-        serp(f"{name} founders team leadership"),
-        prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
-    )
-    market_results = tidy(
-        serp(f"{name} target market TAM customers industry"),
-        prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
-    )
-    competition_results = tidy(
-        serp(f"{name} competitors alternatives comparative"),
-        prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
-    )
+    with st.spinner("Gathering signals..."):
+        overview_results = tidy(
+            serp(f"{name} official site"),
+            prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
+        )
+        team_results = tidy(
+            serp(f"{name} founders team leadership"),
+            prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
+        )
+        market_results = tidy(
+            serp(f"{name} target market TAM customers industry"),
+            prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
+        )
+        competition_results = tidy(
+            serp(f"{name} competitors alternatives comparative"),
+            prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
+        )
 
-    # Optional summary (now stable; no spiral)
+    # Optional AI sections (cached, safe)
     if gen_summary:
         st.subheader("Investor Summary")
-        summary = synthesize_snapshot(name, overview_results, team_results, market_results, competition_results)
-        st.write(summary)
+        st.write(synthesize_snapshot(name, overview_results, team_results, market_results, competition_results))
     else:
-        st.caption("Tip: check the box in the form to generate a 5-bullet Investor Summary.")
+        st.caption("Tip: check the boxes in the form to generate AI summaries (uses your OpenAI quota).")
 
-    # Sections
+    if gen_founder:
+        st.subheader("Founder Brief")
+        st.json(founder_brief(name, team_results))
+    if gen_mmap:
+        st.subheader("Market Map")
+        st.json(market_map(name, competition_results))
+
+    # Always show the raw sections
     render_section("Company Overview", overview_results, "No overview found. Try pasting the official site.")
     render_section("Founding Team",    team_results,     "No team info found. Try 'founders' or 'team'.")
     render_section("Market",           market_results,   "No market info found. Try 'market size' or 'TAM'.")
