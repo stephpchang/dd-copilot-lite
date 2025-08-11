@@ -23,29 +23,27 @@ def serp(q, num=6):
         })
     return hits
 
-# Helper: deduplicate, optionally prefer certain domains, limit to top 3
+# Helper to deduplicate results and optionally prefer certain sources
 def tidy(results, prefer=()):
     """Deduplicate, optionally prefer certain domains, and limit to top 3."""
-    seen = set()
-    out = []
-    for r in results:
-        key = (r.get("title", "").strip().lower(), r.get("url", ""))
-        if key in seen:
+    seen, cleaned = set(), []
+    for item in results:
+        if item["url"] in seen:
             continue
-        seen.add(key)
-        out.append(r)
+        seen.add(item["url"])
+        cleaned.append(item)
     if prefer:
-        out.sort(key=lambda x: 0 if any(p in (x.get("url") or "") for p in prefer) else 1)
-    return out[:3]
+        cleaned.sort(key=lambda x: any(p in x["url"] for p in prefer), reverse=True)
+    return cleaned[:3]
 
-# Helper: render a section or show fallback text
+# Helper to display section results cleanly
 def render_section(title, items, empty_hint):
     st.subheader(title)
-    if items:
-        for it in items:
-            st.write(f"[{it['title']}]({it['url']}) — {it['snippet']}")
+    if not items:
+        st.write(empty_hint)
     else:
-        st.caption(empty_hint)
+        for item in items:
+            st.write(f"[{item['title']}]({item['url']}) — {item['snippet']}")
 
 # Streamlit app setup
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
@@ -63,28 +61,13 @@ if st.button("Run"):
         st.success(f"Profile for {company}")
 
         # Search queries
-        # Smarter queries + preferred sources
-overview_results    = tidy(
-    serp(f"{company} official site", 8),
-    prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
-)
+        overview_results = tidy(serp(f"{company} company overview", num=5), prefer=("crunchbase.com", "linkedin.com"))
+        team_results = tidy(serp(f"{company} founding team", num=5), prefer=("linkedin.com",))
+        market_results = tidy(serp(f"{company} market size trends", num=5))
+        competition_results = tidy(serp(f"{company} competitors", num=5))
 
-team_results        = tidy(
-    serp(f"{company} founders team leadership", 8),
-    prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
-)
-
-market_results      = tidy(
-    serp(f"{company} target market TAM customers industry", 8),
-    prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
-)
-
-competition_results = tidy(
-    serp(f"{company} competitors alternatives comparative", 8),
-    prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
-)
         # Display results
         render_section("Company Overview", overview_results, "No overview found.")
         render_section("Founding Team", team_results, "No team info found.")
         render_section("Market", market_results, "No market info found.")
-        render_section("Competition", competition_results, "No competitors found.")
+        render_section("Competition", competition_results, "No competition info found.")
