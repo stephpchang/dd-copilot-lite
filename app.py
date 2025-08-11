@@ -26,6 +26,7 @@ def serp(q, num=6):
 # Streamlit app setup
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
+st.caption(f"CSE_ID loaded: {'yes' if os.getenv('GOOGLE_CSE_ID') else 'no'} • API_KEY loaded: {'yes' if os.getenv('GOOGLE_API_KEY') else 'no'}")
 st.write("Provides profiles of a company’s team, market, and competition to accelerate early-stage investment assessments.")
 
 # Input
