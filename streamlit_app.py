@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 from app.llm_guard import generate_once
 
-# ---- JSON schema for single-call output (OpenAI json_schema requires "required" for all object properties) ----
+# ---- JSON schema for single-call output (OpenAI json_schema requires "required" to list all properties) ----
 JSON_SCHEMA = {
     "name": "DDLite",
     "strict": True,
@@ -12,10 +12,7 @@ JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "investor_summary": {
-                "type": "string",
-                "description": "3–7 bullet summary in plain text"
-            },
+            "investor_summary": {"type": "string"},
             "founder_brief": {
                 "type": "object",
                 "additionalProperties": False,
@@ -42,10 +39,10 @@ JSON_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "url": {"type": "string"},   # <-- removed format: "uri"
+                        "url": {"type": "string"},
                         "note": {"type": "string"}
                     },
-                    "required": ["url"]
+                    "required": ["url", "note"]
                 }
             }
         },
@@ -112,7 +109,7 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.2.0-jsonschema-fix")
+st.caption("Build: v0.2.1-jsonschema-required-fix")
 
 # Persist inputs
 for key, default in [
