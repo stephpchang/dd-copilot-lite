@@ -2,7 +2,10 @@ import os
 import json
 import requests
 import streamlit as st
+
 from app.llm_guard import generate_once
+from app.public_provider import wiki_enrich          # public enrichment (no keys)
+from app.funding_lookup import get_funding_data      # funding + investors (public/search-based)
 
 # ---- JSON schema for single-call output (OpenAI json_schema requires "required" to list all properties) ----
 JSON_SCHEMA = {
@@ -51,7 +54,7 @@ JSON_SCHEMA = {
 }
 
 # -------------------------
-# Google search helper (cached)
+# Google Custom Search helper (cached)
 # -------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def serp(q, num=6):
@@ -109,14 +112,14 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.2.2-pretty-summaries")
+st.caption("Build: v0.3.0-funding-public")
 
 # Persist inputs
 for key, default in [
     ("company", ""),
-    ("gen_summary", True),         # default ON since summaries look nice now
-    ("gen_founder_brief", True),   # default ON
-    ("gen_market_map", True),      # default ON
+    ("gen_summary", True),
+    ("gen_founder_brief", True),
+    ("gen_market_map", True),
     ("_busy", False),
 ]:
     if key not in st.session_state:
@@ -154,7 +157,7 @@ if submitted and not name:
 if submitted and name:
     st.success(f"Profile for {name}")
 
-    # Gather web signals (no AI)
+    # Gather web signals (no keys required)
     with st.spinner("Gathering signals..."):
         overview_results = tidy(
             serp(f"{name} official site"),
@@ -173,13 +176,46 @@ if submitted and name:
             prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
         )
 
-    # Build a concise list of source URLs from the signals to anchor the model
+    # Public-data enrichment (Wikipedia)
+    wiki = wiki_enrich(name)  # {"title","url","summary"} or None
+
+    # ---- Funding & Investors (public/search-based) ----
+    funding = get_funding_data(name, serp_func=lambda q, num=6: serp(q, num))
+
+    st.subheader("Funding & Investors")
+    rounds = funding.get("rounds") or []
+    investors = funding.get("investors") or []
+
+    if rounds:
+        rows = []
+        for r in rounds[:6]:  # keep compact
+            rows.append({
+                "Round": r.get("round") or "",
+                "Date": r.get("date") or "",
+                "Amount": "${:,}".format(r["amount_usd"]) if r.get("amount_usd") else "",
+                "Lead": ", ".join(r.get("lead_investors") or []),
+            })
+        st.table(rows)
+    else:
+        st.caption("No funding data found yet (public sources).")
+
+    if investors:
+        st.markdown("**Notable investors**")
+        st.write(", ".join(investors[:10]))
+
+    # Build a concise list of source URLs from signals + funding to anchor the model
     sources_list = []
     for coll in (overview_results, team_results, market_results, competition_results):
         for it in coll:
             if it.get("url"):
                 sources_list.append(it["url"])
-    sources_list = list(dict.fromkeys(sources_list))[:10]
+    # add wiki + funding sources
+    if wiki and wiki.get("url"):
+        sources_list.insert(0, wiki["url"])
+    for s in (funding.get("sources") or []):
+        if s:
+            sources_list.append(s)
+    sources_list = list(dict.fromkeys(sources_list))[:10]  # de-dup & trim
 
     # Single guarded OpenAI call (only if any AI section is requested)
     data = None
@@ -189,12 +225,17 @@ if submitted and name:
         else:
             st.session_state._busy = True
             try:
-                # --- Prompt tweak: investor_summary must be newline-bulleted (no numbers) ---
+                # include short background from Wikipedia if available
+                wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
+
                 prompt = f"""
 Return ONE JSON object that matches the provided schema.
 Company: {name}
 Website: null
 User-provided sources: {sources_list}
+
+Background (optional, from Wikipedia):
+{wiki_hint}
 
 Rules:
 - Only use fields defined in the schema.
@@ -225,11 +266,9 @@ Rules:
         # Investor Summary as bullets
         st.subheader("Investor Summary")
         if inv:
-            # Prefer newline bullets ("- "), fall back to sentence split
             lines = [ln.strip() for ln in inv.replace("\r", "").split("\n") if ln.strip()]
             if not lines:
                 lines = [b.strip() for b in inv.split(". ") if b.strip()]
-            # Normalize bullets
             bullets = []
             for b in lines:
                 b = b.lstrip("•- ").strip()
@@ -286,6 +325,13 @@ Rules:
         )
         with st.expander("Show raw JSON"):
             st.code(json.dumps(data, indent=2), language="json")
+
+    # Optional: show the public enrichment match
+    if wiki:
+        st.markdown("**Wikipedia match**")
+        st.write(wiki.get("title") or "")
+        if wiki.get("url"):
+            st.write(wiki["url"])
 
     # Always show the raw web signal sections
     render_section("Company Overview", overview_results, "No overview found. Try pasting the official site.")
