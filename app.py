@@ -1,13 +1,57 @@
 import os
 import json
-import time
 import requests
 import streamlit as st
-import openai  # for catching RateLimitError
-from openai import OpenAI
+from .llm_guard import generate_once
+
+# JSON schema for single-call output
+JSON_SCHEMA = {
+    "name": "DDLite",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "investor_summary": {"type": "string", "description": "3–7 bullet summary in plain text"},
+            "founder_brief": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "founders": {"type": "array", "items": {"type": "string"}},
+                    "highlights": {"type": "array", "items": {"type": "string"}},
+                    "open_questions": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": []
+            },
+            "market_map": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "axes": {"type": "array", "items": {"type": "string"}},
+                    "competitors": {"type": "array", "items": {"type": "string"}},
+                    "differentiators": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": []
+            },
+            "sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "url": {"type": "string", "format": "uri"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        "required": ["investor_summary", "founder_brief", "market_map"]
+    }
+}
 
 # -------------------------
-# Google search helper (now cached)
+# Google search helper (cached)
 # -------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def serp(q, num=6):
@@ -59,133 +103,6 @@ def render_section(title, items, empty_hint):
             st.write(f"{title} — {snip}")
 
 # -------------------------
-# OpenAI helpers (still optional; ignore if rate-limited)
-# -------------------------
-def _openai_client():
-    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-def _trim(items, max_items=3, max_snip=220):
-    out = []
-    for it in (items or [])[:max_items]:
-        out.append({
-            "title": (it.get("title") or "")[:100],
-            "url": it.get("url") or "",
-            "snippet": (it.get("snippet") or "")[:max_snip],
-        })
-    return out
-
-@st.cache_data(show_spinner=False)
-def synthesize_snapshot(company_name, overview_items, team_items, market_items, competition_items):
-    if not os.getenv("OPENAI_API_KEY"):
-        return "Set OPENAI_API_KEY to enable the investor summary."
-    context = {
-        "overview": _trim(overview_items),
-        "team": _trim(team_items),
-        "market": _trim(market_items),
-        "competition": _trim(competition_items),
-    }
-    prompt = f"""
-You are helping an early-stage VC. Using ONLY the JSON provided, write exactly 5 concise bullets for {company_name}:
-- What they do (one line)
-- Founders / leadership (if known)
-- Market context
-- Competitive positioning / key alternatives
-- 1–2 open diligence questions
-
-JSON context:
-{json.dumps(context, ensure_ascii=False)}
-"""
-    client = _openai_client()
-    for _ in range(2):
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            return resp.choices[0].message.content.strip()
-        except openai.RateLimitError:
-            time.sleep(1.5)
-        except Exception as e:
-            return f"(Investor Summary unavailable: {e})"
-    return "(Investor Summary temporarily unavailable due to rate limits. Try again shortly.)"
-
-@st.cache_data(show_spinner=False)
-def founder_brief(company_name, team_items):
-    if not os.getenv("OPENAI_API_KEY"):
-        return {"founders": [], "sources": [], "note": "Set OPENAI_API_KEY for Founder Brief."}
-    ctx = {"team": _trim(team_items, max_items=4)}
-    prompt = f"""
-From these search snippets about the team of {company_name}, extract concise JSON:
-{{
-  "founders":[
-    {{"name": str, "role": str|null, "highlights": [str]}}
-  ],
-  "sources":[str]
-}}
-Only include what is supported by the snippets. If unknown, omit the field.
-
-Snippets JSON:
-{json.dumps(ctx, ensure_ascii=False)}
-"""
-    client = _openai_client()
-    for _ in range(2):
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content":prompt}],
-                temperature=0,
-            )
-            txt = resp.choices[0].message.content.strip().strip("`")
-            try:
-                return json.loads(txt)
-            except Exception:
-                return {"founders": [], "sources": [], "note": txt[:500]}
-        except openai.RateLimitError:
-            time.sleep(1.5)
-        except Exception as e:
-            return {"founders": [], "sources": [], "note": f"Unavailable: {e}"}
-    return {"founders": [], "sources": [], "note": "Rate limited. Try again shortly."}
-
-@st.cache_data(show_spinner=False)
-def market_map(company_name, competition_items):
-    if not os.getenv("OPENAI_API_KEY"):
-        return {"axes": [], "competitors": [], "sources": [], "note": "Set OPENAI_API_KEY for Market Map."}
-    ctx = {"competition": _trim(competition_items, max_items=6)}
-    prompt = f"""
-From these competitor-related snippets for {company_name}, produce concise JSON:
-{{
-  "axes": [str],
-  "competitors": [
-    {{"name": str, "why_similar": str, "url": str|null}}
-  ],
-  "sources":[str]
-}}
-Keep it brief (3–6 competitors). Use only what appears in the snippets.
-
-Snippets JSON:
-{json.dumps(ctx, ensure_ascii=False)}
-"""
-    client = _openai_client()
-    for _ in range(2):
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content":prompt}],
-                temperature=0,
-            )
-            txt = resp.choices[0].message.content.strip().strip("`")
-            try:
-                return json.loads(txt)
-            except Exception:
-                return {"axes": [], "competitors": [], "sources": [], "note": txt[:500]}
-        except openai.RateLimitError:
-            time.sleep(1.5)
-        except Exception as e:
-            return {"axes": [], "competitors": [], "sources": [], "note": f"Unavailable: {e}"}
-    return {"axes": [], "competitors": [], "sources": [], "note": "Rate limited. Try again shortly."}
-
-# -------------------------
 # Streamlit app
 # -------------------------
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
@@ -202,6 +119,8 @@ if "gen_founder_brief" not in st.session_state:
     st.session_state.gen_founder_brief = False
 if "gen_market_map" not in st.session_state:
     st.session_state.gen_market_map = False
+if "_busy" not in st.session_state:
+    st.session_state._busy = False
 
 examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
 
@@ -211,12 +130,12 @@ with st.form("search_form", clear_on_submit=False):
     if example:
         company_input = example
 
-    # Keep AI toggles (you can ignore if rate-limited)
+    # Toggles control which AI sections to render (single API call powers all)
     gen_summary_input    = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
     gen_founder_input    = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
     gen_marketmap_input  = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
 
-    submitted = st.form_submit_button("Run")
+    submitted = st.form_submit_button("Run", disabled=st.session_state.get("_busy", False))
 
 # Update state only on submit
 if submitted:
@@ -236,6 +155,7 @@ if submitted and not name:
 if submitted and name:
     st.success(f"Profile for {name}")
 
+    # Gather web signals (no AI)
     with st.spinner("Gathering signals..."):
         overview_results = tidy(
             serp(f"{name} official site"),
@@ -254,27 +174,69 @@ if submitted and name:
             prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
         )
 
-    # (Optional) AI sections — will show rate-limit messages if quota hit
-    if gen_summary:
-        st.subheader("Investor Summary")
-        st.write(synthesize_snapshot(name, overview_results, team_results, market_results, competition_results))
+    # Build a concise list of source URLs from the signals to anchor the model
+    sources_list = []
+    for coll in (overview_results, team_results, market_results, competition_results):
+        for it in coll:
+            if it.get("url"):
+                sources_list.append(it["url"])
+    # De-dup and trim
+    sources_list = list(dict.fromkeys(sources_list))[:10]
 
-    if gen_founder:
-        st.subheader("Founder Brief")
-        st.json(founder_brief(name, team_results))
+    # Single guarded OpenAI call (only if any AI section is requested)
+    data = None
+    if gen_summary or gen_founder or gen_mmap:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.info("Set OPENAI_API_KEY to enable AI-generated sections.")
+        else:
+            st.session_state._busy = True
+            try:
+                prompt = f"""
+Return ONE JSON object that matches the provided schema.
+Company: {name}
+Website: null
+User-provided sources: {sources_list}
 
-    if gen_mmap:
-        st.subheader("Market Map")
-        st.json(market_map(name, competition_results))
+Rules:
+- Only use fields defined in the schema.
+- If unknown, set null or [].
+- Keep answers concise and factual. Do not invent specifics.
+                """.strip()
 
-    # Always show the raw sections
+                with st.spinner("Generating structured brief..."):
+                    data = generate_once(prompt, JSON_SCHEMA)
+
+            except Exception as e:
+                st.error("There was a problem generating the brief. Please try again.")
+                st.exception(e)
+            finally:
+                st.session_state._busy = False
+
+    # Render AI sections if available
+    if data:
+        if gen_summary:
+            st.subheader("Investor Summary")
+            st.write(data.get("investor_summary") or "No data")
+
+        if gen_founder:
+            st.subheader("Founder Brief")
+            st.json(data.get("founder_brief") or {})
+
+        if gen_mmap:
+            st.subheader("Market Map")
+            st.json(data.get("market_map") or {})
+
+        st.subheader("Raw JSON")
+        st.code(json.dumps(data, indent=2), language="json")
+
+    # Always show the raw web signal sections
     render_section("Company Overview", overview_results, "No overview found. Try pasting the official site.")
     render_section("Founding Team",    team_results,     "No team info found. Try 'founders' or 'team'.")
     render_section("Market",           market_results,   "No market info found. Try 'market size' or 'TAM'.")
     render_section("Competition",      competition_results, "No competition info found. Try 'alternatives'.")
 
     # -------------------------
-    # NEW: Markdown export (no AI required)
+    # Markdown export (no AI required)
     # -------------------------
     import datetime as dt
     def md_list(items):
