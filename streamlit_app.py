@@ -397,4 +397,4 @@ Return ONLY the JSON object; no markdown, no commentary.
     # -------------------------
     import datetime as dt
     def md_list(items):
-        return "\n
+        return "\n".join(f"- {item}" for item in items)
