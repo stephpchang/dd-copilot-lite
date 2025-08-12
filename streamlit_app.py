@@ -10,7 +10,7 @@ from app.funding_lookup import get_funding_data      # funding + investors (publ
 # -------------------------
 # Streamlit app config
 # -------------------------
-st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="wide")
+st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
 st.caption("Build: v0.5.0 – TAM + revenue + monetization")
