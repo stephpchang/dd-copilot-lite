@@ -273,9 +273,9 @@ if submitted and name:
         # Optional glance line
         total_str = _fmt_usd(funding_stats.get("total_usd"))
         largest = funding_stats.get("largest") or {}
-        largest_str = f"{largest.get('round') or '—'}, {_fmt_usd(largest.get('amount_usd'))} ({largest.get('date') or '—'})"
+        largest_str = f"{largest.get('round') or '—'} · {_fmt_usd(largest.get('amount_usd'))} · {largest.get('date') or '—'}"
         leads_str = ", ".join(funding_stats.get("lead_investors") or []) or "—"
-        st.caption(f"Funding at a glance: Total {total_str}; Largest: {largest_str}; Leads: {leads_str}")
+        st.markdown(f"**Funding at a glance:** Total **{total_str}** · Largest **{largest_str}** · Leads **{leads_str}**")
     else:
         st.caption("No funding data found yet (public sources).")
 
@@ -378,9 +378,10 @@ Return ONLY the JSON object; no markdown, no commentary.
             bullets = []
             for b in lines:
                 b = b.lstrip("•- ").strip()
-                if not b.endswith("."):
+                if not b.endswith((".", "?", "!")):
                     b += "."
                 bullets.append(b)
+
             for b in bullets[:7]:
                 st.write(f"- {b}")
         else:
