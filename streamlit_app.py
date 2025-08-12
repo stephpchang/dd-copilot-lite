@@ -4,8 +4,9 @@ import requests
 import streamlit as st
 
 from app.llm_guard import generate_once
-from app.public_provider import wiki_enrich          # public enrichment (no keys)
-from app.funding_lookup import get_funding_data      # funding + investors (public/search-based)
+from app.public_provider import wiki_enrich
+from app.funding_lookup import get_funding_data
+from app.market_size import get_market_size
 
 # -------------------------
 # Streamlit app config
@@ -13,10 +14,10 @@ from app.funding_lookup import get_funding_data      # funding + investors (publ
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.6.0 – funding-stats in summary + TAM + revenue + monetization")
+st.caption("Build: v0.7.0 – tighter funding parse + TAM hints + centered layout")
 
 # -------------------------
-# JSON schema (OpenAI json_schema: every object with properties must list all in 'required')
+# JSON schema (OpenAI json_schema requires listing all props in 'required')
 # -------------------------
 JSON_SCHEMA = {
     "name": "DDLite",
@@ -251,10 +252,10 @@ if submitted and name:
     wiki = wiki_enrich(name)  # {"title","url","summary"} or None
 
     # -------------------------
-    # Funding & Investors (public/search-based)
+    # Funding & Investors (public/search-based) + stats
     # -------------------------
     funding = get_funding_data(name, serp_func=lambda q, num=6: serp(q, num))
-    funding_stats = _funding_stats(funding)  # <-- pre-compute for prompt + optional display
+    funding_stats = _funding_stats(funding)
 
     st.subheader("Funding & Investors")
     rounds = funding.get("rounds") or []
@@ -262,7 +263,7 @@ if submitted and name:
 
     if rounds:
         rows = []
-        for r in rounds[:6]:  # keep compact
+        for r in rounds[:6]:
             rows.append({
                 "Round": r.get("round") or "",
                 "Date": r.get("date") or "",
@@ -270,12 +271,19 @@ if submitted and name:
                 "Lead": ", ".join(r.get("lead_investors") or []),
             })
         st.table(rows)
-        # Optional glance line
+
+        # Funding at a glance (robust formatting)
         total_str = _fmt_usd(funding_stats.get("total_usd"))
         largest = funding_stats.get("largest") or {}
-        largest_str = f"{largest.get('round') or '—'} · {_fmt_usd(largest.get('amount_usd'))} · {largest.get('date') or '—'}"
+        lr_round = largest.get("round") or "—"
+        lr_amt   = _fmt_usd(largest.get("amount_usd"))
+        lr_date  = largest.get("date") or "—"
         leads_str = ", ".join(funding_stats.get("lead_investors") or []) or "—"
-        st.markdown(f"**Funding at a glance:** Total **{total_str}** · Largest **{largest_str}** · Leads **{leads_str}**")
+        st.markdown(
+            f"**Funding at a glance:** Total **{total_str}** · "
+            f"Largest **{lr_round} – {lr_amt} – {lr_date}** · "
+            f"Leads **{leads_str}**"
+        )
     else:
         st.caption("No funding data found yet (public sources).")
 
@@ -284,7 +292,12 @@ if submitted and name:
         st.write(", ".join(investors[:10]))
 
     # -------------------------
-    # Build grounding sources for the LLM
+    # Market Size (public/search-based) for TAM hints
+    # -------------------------
+    market_size = get_market_size(name, serp_func=lambda q, num=6: serp(q, num))
+
+    # -------------------------
+    # Build grounding sources for the LLM (include wiki, funding, TAM)
     # -------------------------
     sources_list = []
     for coll in (overview_results, team_results, market_results, competition_results):
@@ -294,6 +307,9 @@ if submitted and name:
     if wiki and wiki.get("url"):
         sources_list.insert(0, wiki["url"])
     for s in (funding.get("sources") or []):
+        if s:
+            sources_list.append(s)
+    for s in (market_size.get("sources") or []):
         if s:
             sources_list.append(s)
     sources_list = list(dict.fromkeys(sources_list))[:10]  # de-dup & trim
@@ -310,6 +326,16 @@ if submitted and name:
             try:
                 wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
 
+                # Build short TAM hints list
+                ms_hints = []
+                for e in (market_size.get("estimates") or [])[:3]:
+                    amt = e.get("amount_usd")
+                    year = e.get("year") or "n/a"
+                    scope = e.get("scope") or "Market size"
+                    if amt:
+                        ms_hints.append(f"- {scope}: ${amt:,} ({year})")
+                ms_hints_txt = "\n".join(ms_hints) if ms_hints else "- None found"
+
                 prompt = f"""
 Return ONE JSON object that matches the provided schema.
 Company: {name}
@@ -325,6 +351,9 @@ Known funding facts (parsed from public sources; prefer these over guessing):
 - Largest round amount: {_fmt_usd((funding_stats.get('largest') or {}).get('amount_usd'))}
 - Largest round date: {((funding_stats.get('largest') or {}).get('date')) or 'unknown'}
 - Lead investor(s): {', '.join(funding_stats.get('lead_investors') or []) or 'unknown'}
+
+Known market size indications (from public snippets):
+{ms_hints_txt}
 
 Instructions:
 - Only use fields defined in the schema and keep them concise.
@@ -381,7 +410,6 @@ Return ONLY the JSON object; no markdown, no commentary.
                 if not b.endswith((".", "?", "!")):
                     b += "."
                 bullets.append(b)
-
             for b in bullets[:7]:
                 st.write(f"- {b}")
         else:
