@@ -2,7 +2,7 @@ import os
 import json
 import requests
 import streamlit as st
-from .llm_guard import generate_once
+from app.llm_guard import generate_once
 
 # JSON schema for single-call output
 JSON_SCHEMA = {
