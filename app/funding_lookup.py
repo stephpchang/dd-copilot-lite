@@ -148,7 +148,6 @@ def _dedupe_rounds(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: (x.get("amount_usd") or 0), reverse=True)
     return out
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int], List[Dict[str, str]]]] = None) -> Dict[str, Any]:
     """
     Returns a dict:
