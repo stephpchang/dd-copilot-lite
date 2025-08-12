@@ -7,7 +7,8 @@ from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich          # public enrichment (no keys)
 from app.funding_lookup import get_funding_data      # funding + investors (public/search-based)
 
-# ---- JSON schema for single-call output (OpenAI json_schema requires "required" to list all properties) ----
+# ---- JSON schema for single-call output ----
+# NOTE: For OpenAI json_schema, any object with "properties" must have "required" listing ALL those props.
 JSON_SCHEMA = {
     "name": "DDLite",
     "strict": True,
@@ -36,6 +37,23 @@ JSON_SCHEMA = {
                 },
                 "required": ["axes", "competitors", "differentiators"]
             },
+            "market_size": {
+                "type": "string",
+                "description": "TAM in USD + region + source + year (plain text). If unknown: 'Not found from public sources.'"
+            },
+            "estimated_revenue": {
+                "type": "string",
+                "description": "Latest public estimate or guidance in USD with year/source if possible; else 'Not found'."
+            },
+            "monetization": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "business_model": {"type": "string"},  # e.g., SaaS subscription, usage-based, ads, marketplace take-rate
+                    "revenue_streams": {"type": "array", "items": {"type": "string"}}  # e.g., 'Enterprise SaaS', 'API usage fees'
+                },
+                "required": ["business_model", "revenue_streams"]
+            },
             "sources": {
                 "type": "array",
                 "items": {
@@ -49,7 +67,15 @@ JSON_SCHEMA = {
                 }
             }
         },
-        "required": ["investor_summary", "founder_brief", "market_map", "sources"]
+        "required": [
+            "investor_summary",
+            "founder_brief",
+            "market_map",
+            "market_size",
+            "estimated_revenue",
+            "monetization",
+            "sources"
+        ]
     }
 }
 
@@ -112,7 +138,7 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.3.0-funding-public")
+st.caption("Build: v0.4.0-market-revenue-monetization")
 
 # Persist inputs
 for key, default in [
@@ -237,15 +263,21 @@ User-provided sources: {sources_list}
 Background (optional, from Wikipedia):
 {wiki_hint}
 
-Rules:
-- Only use fields defined in the schema.
-- For investor_summary, return 3–7 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
-  Example:
-  - First concise point
-  - Second concise point
-  - Third concise point
-- If unknown, set null or [].
-- Keep answers concise and factual. Do not invent specifics.
+Instructions:
+- Only use fields defined in the schema and keep them concise.
+- For investor_summary: return 3–7 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
+- For founder_brief: concise lists only; omit anything not supported by public references.
+- For market_map: keep to 1–2 axes, 3–5 competitors, and 2–4 differentiators.
+- For market_size: give the most recent credible TAM figure with USD amount, region (global/region), source name, and year.
+  If not found, return "Not found from public sources."
+- For estimated_revenue: return the most recent public revenue/gross bookings/ARR estimate in USD (state metric),
+  with year and source; if not found, return "Not found".
+- For monetization:
+  - business_model: 1–2 lines (e.g., "SaaS subscription with usage-based pricing").
+  - revenue_streams: 2–5 concise bullets (e.g., "Enterprise SaaS", "API usage fees", "Professional services").
+- For sources: include up to 10 URLs with a short note; notes can be empty strings.
+
+Return ONLY the JSON object; no markdown, no commentary.
                 """.strip()
 
                 with st.spinner("Generating structured brief..."):
@@ -262,6 +294,9 @@ Rules:
         inv = (data.get("investor_summary") or "").strip()
         fb  = data.get("founder_brief") or {}
         mm  = data.get("market_map") or {}
+        ms  = (data.get("market_size") or "").strip()
+        rev = (data.get("estimated_revenue") or "").strip()
+        mon = (data.get("monetization") or {}) or {}
 
         # Investor Summary as bullets
         st.subheader("Investor Summary")
@@ -316,6 +351,24 @@ Rules:
             for d in differentiators:
                 st.write(f"- {d}")
 
+        # Market Size & Revenue & Monetization
+        st.subheader("Market Size (TAM)")
+        st.write(ms or "Not found from public sources.")
+
+        st.subheader("Estimated Revenue")
+        st.write(rev or "Not found")
+
+        st.subheader("Monetization")
+        bm  = mon.get("business_model") or ""
+        rvs = mon.get("revenue_streams") or []
+        if bm:
+            st.markdown("**Business model**")
+            st.write(bm)
+        if rvs:
+            st.markdown("**Revenue streams**")
+            for item in rvs[:6]:
+                st.write(f"- {item}")
+
         # Export + Raw JSON tucked away
         st.download_button(
             "Download JSON",
@@ -344,21 +397,4 @@ Rules:
     # -------------------------
     import datetime as dt
     def md_list(items):
-        return "\n".join([f"- [{i['title']}]({i['url']}) — {i['snippet']}" for i in items]) or "_No items_"
-
-    md = f"""# {name} — First-Pass Diligence
-_Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_
-
-## Overview
-{md_list(overview_results)}
-
-## Founding Team
-{md_list(team_results)}
-
-## Market
-{md_list(market_results)}
-
-## Competition
-{md_list(competition_results)}
-"""
-    st.download_button("Download snapshot (Markdown)", md, file_name=f"{name}_snapshot.md")
+        return "\n
