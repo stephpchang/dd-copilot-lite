@@ -3,6 +3,8 @@ import json
 import requests
 import streamlit as st
 from app.llm_guard import generate_once
+APP_VERSION = "v0.2.0-setup-check"  # trigger redeploy
+
 
 # JSON schema for single-call output
 JSON_SCHEMA = {
@@ -108,6 +110,7 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
+st.caption("Build: v0.2.0-setup-check")  # trigger redeploy
 st.write("Provides profiles of a company’s team, market, and competition to accelerate early-stage investment assessments.")
 
 # Persist inputs
