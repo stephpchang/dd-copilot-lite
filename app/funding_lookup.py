@@ -1,7 +1,7 @@
 # app/funding_lookup.py
 import re
 import math
-from typing import Callable, Dict, List, Any, Tuple, Optional
+from typing import Callable, Dict, List, Any, Optional
 import streamlit as st
 
 # ----- Seed demo data so the feature works even with no live hits -----
@@ -53,6 +53,7 @@ _SEED: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# ----- Parsing regexes -----
 _ROUND_PAT = re.compile(
     r"\b(pre[-\s]?seed|seed|series\s+[a-k]|growth|mezzanine|bridge|venture|angel)\b",
     re.I,
@@ -70,14 +71,15 @@ _DATE_PAT = re.compile(
 
 def _norm_round(s: str) -> str:
     s = s.lower().strip()
-    s = s.replace("series ", "Series ").replace("seed", "Seed").replace("pre-Seed", "Pre-Seed")
-    # capitalize first letter of Series letter if needed
-    if s.lower().startswith("series "):
+    s = s.replace("series ", "Series ").replace("seed", "Seed")
+    if s.startswith("series "):
         parts = s.split()
         if len(parts) == 2:
             return f"Series {parts[1].upper()}"
-    if s.lower() == "seed": return "Seed"
-    if s.lower() == "pre seed" or s.lower() == "pre-seed": return "Pre-Seed"
+    if s in ("pre seed", "pre-seed"):
+        return "Pre-Seed"
+    if s == "seed":
+        return "Seed"
     return s.title()
 
 def _to_usd(amount: str, unit: Optional[str]) -> Optional[int]:
@@ -88,13 +90,17 @@ def _to_usd(amount: str, unit: Optional[str]) -> Optional[int]:
     factor = 1.0
     if unit:
         u = unit.lower()
-        if u in ("billion", "bn", "b"): factor = 1_000_000_000
-        elif u in ("million", "mm", "m"): factor = 1_000_000
-        elif u in ("thousand", "k"): factor = 1_000
+        if u in ("billion", "bn", "b"):
+            factor = 1_000_000_000
+        elif u in ("million", "mm", "m"):
+            factor = 1_000_000
+        elif u in ("thousand", "k"):
+            factor = 1_000
     return int(math.floor(amt * factor))
 
 def _fmt_usd(n: Optional[int]) -> str:
-    if not n: return ""
+    if not n:
+        return ""
     return "${:,}".format(n)
 
 def _parse_snippet(snippet: str) -> Dict[str, Any]:
@@ -104,17 +110,16 @@ def _parse_snippet(snippet: str) -> Dict[str, Any]:
     if r:
         out["round"] = _norm_round(r.group(1))
     # Amount
-    a = _amount_pat.search(snippet or "")
+    a = _AMOUNT_PAT.search(snippet or "")  # <-- fixed: use the ALL-CAPS name
     if a:
         out["amount_usd"] = _to_usd(a.group(1), a.group(2))
     # Lead investor
     l = _LEAD_PAT.search(snippet or "")
     if l:
-        # split on "and", "," to get first entity
         lead = l.group(1).strip()
         lead = re.split(r"\band\b|,|;", lead)[0].strip()
         out["lead_investors"] = [lead]
-    # Date (very loose; prefer YYYY if that’s all we have)
+    # Date (loose; prefer YYYY if that's all we have)
     d = _DATE_PAT.search(snippet or "")
     if d:
         out["date"] = d.group(0)
@@ -123,7 +128,8 @@ def _parse_snippet(snippet: str) -> Dict[str, Any]:
 def _merge_round(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(a)
     for k, v in b.items():
-        if v in (None, "", [], {}): continue
+        if v in (None, "", [], {}):
+            continue
         if k == "lead_investors":
             existing = set(out.get("lead_investors") or [])
             for x in (v or []):
@@ -144,13 +150,15 @@ def _dedupe_rounds(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         else:
             buckets[key] = r
     out = list(buckets.values())
-    # sort roughly by amount desc, then by date string present
     out.sort(key=lambda x: (x.get("amount_usd") or 0), reverse=True)
     return out
 
-def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int], List[Dict[str, str]]]] = None) -> Dict[str, Any]:
+def get_funding_data(
+    company_name: str,
+    serp_func: Optional[Callable[[str, int], List[Dict[str, str]]]] = None
+) -> Dict[str, Any]:
     """
-    Returns a dict:
+    Returns:
     {
       "rounds": [
         {"round": str, "date": str|None, "amount_usd": int|None,
@@ -163,7 +171,7 @@ def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int],
     name_key = (company_name or "").strip().lower()
     result: Dict[str, Any] = {"rounds": [], "investors": [], "sources": []}
 
-    # 1) Seed data first (stable demo)
+    # 1) Seed data
     if name_key in _SEED:
         rounds = _SEED[name_key]["rounds"]
         result["rounds"].extend(rounds)
@@ -174,7 +182,7 @@ def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int],
             if r.get("source") and r["source"] not in result["sources"]:
                 result["sources"].append(r["source"])
 
-    # 2) Lightweight search‑based extraction (if serp available)
+    # 2) Search-based extraction
     if serp_func:
         queries = [
             f"{company_name} raises funding round led by",
@@ -182,15 +190,13 @@ def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int],
             f"{company_name} investment round amount",
             f"{company_name} lead investor funding",
         ]
-        hits = []
+        hits: List[Dict[str, str]] = []
         for q in queries:
             try:
-                # your serp returns: [{title, snippet, url}]
-                hits.extend(serp_func(q, num=6))
+                hits.extend(serp_func(q, num=6))  # serp returns [{title,snippet,url}]
             except Exception:
                 pass
 
-        # parse snippets
         parsed_rounds: List[Dict[str, Any]] = []
         for h in hits:
             snip = h.get("snippet") or ""
@@ -206,11 +212,9 @@ def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int],
 
         if parsed_rounds:
             merged = _dedupe_rounds(parsed_rounds)
-            # append, but avoid duplicating seed entries with same round label
             existing_labels = {r.get("round") for r in result["rounds"]}
             for r in merged:
                 if r.get("round") in existing_labels:
-                    # merge into existing
                     for i, ex in enumerate(result["rounds"]):
                         if ex.get("round") == r.get("round"):
                             result["rounds"][i] = _merge_round(ex, r)
@@ -218,17 +222,16 @@ def get_funding_data(company_name: str, serp_func: Optional[Callable[[str, int],
                 else:
                     result["rounds"].append(r)
 
-            # derive investors list from rounds
-            invs = []
+            invs: List[str] = []
             for r in result["rounds"]:
                 invs.extend(r.get("lead_investors") or [])
                 invs.extend(r.get("other_investors") or [])
-            # de‑dup while preserving order
             seen = set()
-            uniq = []
+            uniq: List[str] = []
             for x in invs:
                 if x and x not in seen:
-                    seen.add(x); uniq.append(x)
+                    seen.add(x)
+                    uniq.append(x)
             result["investors"] = uniq or result["investors"]
 
     return result
