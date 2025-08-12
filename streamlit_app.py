@@ -3,10 +3,8 @@ import json
 import requests
 import streamlit as st
 from app.llm_guard import generate_once
-APP_VERSION = "v0.2.0-setup-check"  # trigger redeploy
 
-
-# JSON schema for single-call output
+# ---- JSON schema for single-call output (OpenAI json_schema requires "required" for all object properties) ----
 JSON_SCHEMA = {
     "name": "DDLite",
     "strict": True,
@@ -14,7 +12,10 @@ JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "investor_summary": {"type": "string", "description": "3–7 bullet summary in plain text"},
+            "investor_summary": {
+                "type": "string",
+                "description": "3–7 bullet summary in plain text"
+            },
             "founder_brief": {
                 "type": "object",
                 "additionalProperties": False,
@@ -23,7 +24,7 @@ JSON_SCHEMA = {
                     "highlights": {"type": "array", "items": {"type": "string"}},
                     "open_questions": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": []
+                "required": ["founders", "highlights", "open_questions"]
             },
             "market_map": {
                 "type": "object",
@@ -33,7 +34,7 @@ JSON_SCHEMA = {
                     "competitors": {"type": "array", "items": {"type": "string"}},
                     "differentiators": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": []
+                "required": ["axes", "competitors", "differentiators"]
             },
             "sources": {
                 "type": "array",
@@ -48,7 +49,7 @@ JSON_SCHEMA = {
                 }
             }
         },
-        "required": ["investor_summary", "founder_brief", "market_map"]
+        "required": ["investor_summary", "founder_brief", "market_map", "sources"]
     }
 }
 
@@ -68,9 +69,11 @@ def serp(q, num=6):
         timeout=15,
     )
     if resp.status_code != 200:
-        return [{"title": "Search error",
-                 "snippet": f"HTTP {resp.status_code}: {resp.text[:120]}...",
-                 "url": ""}]
+        return [{
+            "title": "Search error",
+            "snippet": f"HTTP {resp.status_code}: {resp.text[:120]}...",
+            "url": ""
+        }]
     items = (resp.json().get("items") or [])[:num]
     return [{"title": it.get("title",""), "snippet": it.get("snippet",""), "url": it.get("link","")} for it in items]
 
@@ -78,7 +81,6 @@ def serp(q, num=6):
 # Result cleanup + rendering
 # -------------------------
 def tidy(results, prefer=(), limit=3):
-    """Deduplicate by URL, optionally prefer domains, return top N."""
     seen, cleaned = set(), []
     for r in results or []:
         url = r.get("url") or ""
@@ -96,13 +98,13 @@ def render_section(title, items, empty_hint):
         st.caption(empty_hint)
         return
     for it in items:
-        title = it.get("title") or "(no title)"
+        ttl = it.get("title") or "(no title)"
         url = it.get("url") or ""
         snip = it.get("snippet") or ""
         if url:
-            st.write(f"[{title}]({url}) — {snip}")
+            st.write(f"[{ttl}]({url}) — {snip}")
         else:
-            st.write(f"{title} — {snip}")
+            st.write(f"{ttl} — {snip}")
 
 # -------------------------
 # Streamlit app
@@ -110,20 +112,18 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.2.0-setup-check")  # trigger redeploy
-st.write("Provides profiles of a company’s team, market, and competition to accelerate early-stage investment assessments.")
+st.caption("Build: v0.2.0-jsonschema-fix")
 
 # Persist inputs
-if "company" not in st.session_state:
-    st.session_state.company = ""
-if "gen_summary" not in st.session_state:
-    st.session_state.gen_summary = False
-if "gen_founder_brief" not in st.session_state:
-    st.session_state.gen_founder_brief = False
-if "gen_market_map" not in st.session_state:
-    st.session_state.gen_market_map = False
-if "_busy" not in st.session_state:
-    st.session_state._busy = False
+for key, default in [
+    ("company", ""),
+    ("gen_summary", False),
+    ("gen_founder_brief", False),
+    ("gen_market_map", False),
+    ("_busy", False),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
 
@@ -133,10 +133,9 @@ with st.form("search_form", clear_on_submit=False):
     if example:
         company_input = example
 
-    # Toggles control which AI sections to render (single API call powers all)
-    gen_summary_input    = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
-    gen_founder_input    = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
-    gen_marketmap_input  = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
+    gen_summary_input   = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
+    gen_founder_input   = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
+    gen_marketmap_input = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
 
     submitted = st.form_submit_button("Run", disabled=st.session_state.get("_busy", False))
 
@@ -183,14 +182,13 @@ if submitted and name:
         for it in coll:
             if it.get("url"):
                 sources_list.append(it["url"])
-    # De-dup and trim
     sources_list = list(dict.fromkeys(sources_list))[:10]
 
     # Single guarded OpenAI call (only if any AI section is requested)
     data = None
     if gen_summary or gen_founder or gen_mmap:
         if not os.getenv("OPENAI_API_KEY"):
-            st.info("Set OPENAI_API_KEY to enable AI-generated sections.")
+            st.info("Set OPENAI_API_KEY in Streamlit Secrets to enable AI sections.")
         else:
             st.session_state._busy = True
             try:
