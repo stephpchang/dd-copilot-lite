@@ -9,22 +9,18 @@ import streamlit as st
 from openai import OpenAI
 
 
-# One shared semaphore to serialize outbound calls and avoid bursts
 @st.cache_resource
 def _rate_limit_lock() -> threading.BoundedSemaphore:
+    # Serialize calls across sessions to avoid bursts and 429s
     return threading.BoundedSemaphore(value=1)
 
 
 def _get_model() -> str:
-    # Default to a low-cost model
     return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def _get_client() -> OpenAI:
-    """
-    Lazy-create the OpenAI client so missing keys do not crash import time.
-    Raises a RuntimeError with a friendly message if the key is not set.
-    """
+    # Lazy-create the client so missing keys don't crash import time
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -34,17 +30,11 @@ def _get_client() -> OpenAI:
 
 
 def _retry_after_seconds(exc: Exception) -> Optional[int]:
-    """
-    Try to read Retry-After from the SDK error response, if present.
-    """
     try:
         resp = getattr(exc, "response", None)
         headers = getattr(resp, "headers", None)
         val = headers.get("retry-after") if headers else None
-        if val is None:
-            return None
-        # Some environments give str, some int-like
-        return int(str(val))
+        return int(str(val)) if val is not None else None
     except Exception:
         return None
 
@@ -52,21 +42,18 @@ def _retry_after_seconds(exc: Exception) -> Optional[int]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate_once(prompt: str, json_schema: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Make a single structured-output call with caching and retries.
-    - Caches by (prompt, json_schema) for 1 hour
-    - Serializes calls across sessions via a semaphore
-    - Respects Retry-After and uses exponential backoff on transient errors
+    One structured-output call with caching and retries.
+    - Cache key: (prompt, json_schema)
+    - Shared semaphore to prevent concurrent bursts
+    - Exponential backoff; honors Retry-After when present
     """
     lock = _rate_limit_lock()
     with lock:
-        attempt = 0
-        max_attempts = 5
-        sleep = 1
-
+        attempt, max_attempts, sleep = 0, 5, 1
         while True:
             attempt += 1
             try:
-                client = _get_client()  # lazy create here
+                client = _get_client()
                 resp = client.chat.completions.create(
                     model=_get_model(),
                     messages=[
@@ -76,23 +63,11 @@ def generate_once(prompt: str, json_schema: Dict[str, Any]) -> Dict[str, Any]:
                     response_format={"type": "json_schema", "json_schema": json_schema},
                     temperature=0.2,
                 )
-
                 content = resp.choices[0].message.content
-                try:
-                    return json.loads(content)
-                except Exception as parse_err:
-                    # Surface a clearer error so the UI can show it
-                    raise ValueError(f"Model returned non-JSON content: {str(parse_err)}") from parse_err
-
+                return json.loads(content)
             except Exception as e:
-                # On last attempt, re-raise immediately
                 if attempt >= max_attempts:
                     raise
-
-                # Respect server-provided backoff when available
-                retry_after = _retry_after_seconds(e)
-                wait = retry_after if retry_after is not None else sleep
+                wait = _retry_after_seconds(e) or sleep
                 time.sleep(wait)
-
-                # Exponential backoff with a reasonable cap
                 sleep = min(sleep * 2, 20)
