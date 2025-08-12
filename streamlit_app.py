@@ -13,7 +13,7 @@ from app.funding_lookup import get_funding_data      # funding + investors (publ
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.5.0 – TAM + revenue + monetization")
+st.caption("Build: v0.6.0 – funding-stats in summary + TAM + revenue + monetization")
 
 # -------------------------
 # JSON schema (OpenAI json_schema: every object with properties must list all in 'required')
@@ -142,6 +142,47 @@ def render_section(title, items, empty_hint):
             st.write(f"{ttl} — {snip}")
 
 # -------------------------
+# Funding helpers for Investor Summary
+# -------------------------
+def _fmt_usd(n: int | None) -> str:
+    return f"${n:,}" if isinstance(n, int) and n > 0 else "unknown"
+
+def _funding_stats(funding: dict) -> dict:
+    """
+    funding: {"rounds":[{"round","date","amount_usd","lead_investors":[..], ...}], ...}
+    returns:
+      {
+        "total_usd": int|None,
+        "largest": {"round":str|None, "date":str|None, "amount_usd":int|None, "lead":str|None}|None,
+        "lead_investors": [str]
+      }
+    """
+    rounds = (funding or {}).get("rounds") or []
+    total = 0
+    largest = None
+    for r in rounds:
+        amt = r.get("amount_usd") or 0
+        if isinstance(amt, int):
+            total += amt
+        if not largest or (isinstance(amt, int) and amt > (largest.get("amount_usd") or 0)):
+            largest = {
+                "round": r.get("round"),
+                "date": r.get("date"),
+                "amount_usd": amt if isinstance(amt, int) else None,
+                "lead": (", ".join(r.get("lead_investors") or []) or None),
+            }
+    leads = []
+    for r in rounds:
+        for li in (r.get("lead_investors") or []):
+            if li and li not in leads:
+                leads.append(li)
+    return {
+        "total_usd": total if total > 0 else None,
+        "largest": largest,
+        "lead_investors": leads[:5],
+    }
+
+# -------------------------
 # UI state
 # -------------------------
 for key, default in [
@@ -213,6 +254,7 @@ if submitted and name:
     # Funding & Investors (public/search-based)
     # -------------------------
     funding = get_funding_data(name, serp_func=lambda q, num=6: serp(q, num))
+    funding_stats = _funding_stats(funding)  # <-- pre-compute for prompt + optional display
 
     st.subheader("Funding & Investors")
     rounds = funding.get("rounds") or []
@@ -228,6 +270,12 @@ if submitted and name:
                 "Lead": ", ".join(r.get("lead_investors") or []),
             })
         st.table(rows)
+        # Optional glance line
+        total_str = _fmt_usd(funding_stats.get("total_usd"))
+        largest = funding_stats.get("largest") or {}
+        largest_str = f"{largest.get('round') or '—'}, {_fmt_usd(largest.get('amount_usd'))} ({largest.get('date') or '—'})"
+        leads_str = ", ".join(funding_stats.get("lead_investors") or []) or "—"
+        st.caption(f"Funding at a glance: Total {total_str}; Largest: {largest_str}; Leads: {leads_str}")
     else:
         st.caption("No funding data found yet (public sources).")
 
@@ -271,9 +319,22 @@ User-provided sources: {sources_list}
 Background (optional, from Wikipedia):
 {wiki_hint}
 
+Known funding facts (parsed from public sources; prefer these over guessing):
+- Total funding (USD): {_fmt_usd(funding_stats.get('total_usd'))}
+- Largest round: {((funding_stats.get('largest') or {}).get('round')) or 'unknown'}
+- Largest round amount: {_fmt_usd((funding_stats.get('largest') or {}).get('amount_usd'))}
+- Largest round date: {((funding_stats.get('largest') or {}).get('date')) or 'unknown'}
+- Lead investor(s): {', '.join(funding_stats.get('lead_investors') or []) or 'unknown'}
+
 Instructions:
 - Only use fields defined in the schema and keep them concise.
-- For investor_summary: return 3–7 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
+- For investor_summary: return 5 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
+  The bullets MUST cover, in order:
+  1) What the company does (one line).
+  2) Funding to date as a number (e.g., "Total funding {_fmt_usd(funding_stats.get('total_usd'))}") and the largest round with amount and date.
+  3) Lead investor(s) (use the list above if available).
+  4) Market context (size/TAM or category positioning).
+  5) 1–2 open diligence questions.
 - For founder_brief: concise lists only; omit anything not supported by public references.
 - For market_map: keep to 1–2 axes, 3–5 competitors, and 2–4 differentiators.
 - For market_size: give the most recent credible TAM figure with USD amount, region (global/region), source name, and year.
