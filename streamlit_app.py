@@ -12,7 +12,7 @@ JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "investor_summary": {"type": "string"},
+            "investor_summary": {"type": "string"},  # newline-bulleted text
             "founder_brief": {
                 "type": "object",
                 "additionalProperties": False,
@@ -109,14 +109,14 @@ def render_section(title, items, empty_hint):
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.2.1-jsonschema-required-fix")
+st.caption("Build: v0.2.2-pretty-summaries")
 
 # Persist inputs
 for key, default in [
     ("company", ""),
-    ("gen_summary", False),
-    ("gen_founder_brief", False),
-    ("gen_market_map", False),
+    ("gen_summary", True),         # default ON since summaries look nice now
+    ("gen_founder_brief", True),   # default ON
+    ("gen_market_map", True),      # default ON
     ("_busy", False),
 ]:
     if key not in st.session_state:
@@ -189,6 +189,7 @@ if submitted and name:
         else:
             st.session_state._busy = True
             try:
+                # --- Prompt tweak: investor_summary must be newline-bulleted (no numbers) ---
                 prompt = f"""
 Return ONE JSON object that matches the provided schema.
 Company: {name}
@@ -197,6 +198,11 @@ User-provided sources: {sources_list}
 
 Rules:
 - Only use fields defined in the schema.
+- For investor_summary, return 3–7 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
+  Example:
+  - First concise point
+  - Second concise point
+  - Third concise point
 - If unknown, set null or [].
 - Keep answers concise and factual. Do not invent specifics.
                 """.strip()
@@ -210,22 +216,76 @@ Rules:
             finally:
                 st.session_state._busy = False
 
-    # Render AI sections if available
+    # -------- Pretty summaries (with Raw JSON tucked away) --------
     if data:
-        if gen_summary:
-            st.subheader("Investor Summary")
-            st.write(data.get("investor_summary") or "No data")
+        inv = (data.get("investor_summary") or "").strip()
+        fb  = data.get("founder_brief") or {}
+        mm  = data.get("market_map") or {}
 
-        if gen_founder:
-            st.subheader("Founder Brief")
-            st.json(data.get("founder_brief") or {})
+        # Investor Summary as bullets
+        st.subheader("Investor Summary")
+        if inv:
+            # Prefer newline bullets ("- "), fall back to sentence split
+            lines = [ln.strip() for ln in inv.replace("\r", "").split("\n") if ln.strip()]
+            if not lines:
+                lines = [b.strip() for b in inv.split(". ") if b.strip()]
+            # Normalize bullets
+            bullets = []
+            for b in lines:
+                b = b.lstrip("•- ").strip()
+                if not b.endswith("."):
+                    b += "."
+                bullets.append(b)
+            for b in bullets[:7]:
+                st.write(f"- {b}")
+        else:
+            st.caption("No summary available.")
 
-        if gen_mmap:
-            st.subheader("Market Map")
-            st.json(data.get("market_map") or {})
+        # Founder Brief (compact)
+        st.subheader("Founder Brief")
+        founders        = (fb.get("founders") or [])[:3]
+        founder_points  = (fb.get("highlights") or [])[:5]
+        open_qs         = (fb.get("open_questions") or [])[:5]
 
-        st.subheader("Raw JSON")
-        st.code(json.dumps(data, indent=2), language="json")
+        if founders:
+            st.markdown("**Founders**")
+            st.write(", ".join(founders))
+        if founder_points:
+            st.markdown("**Highlights**")
+            for p in founder_points:
+                st.write(f"- {p}")
+        if open_qs:
+            st.markdown("**Open Questions**")
+            for q in open_qs:
+                st.write(f"- {q}")
+
+        # Market Map (compact)
+        st.subheader("Market Map")
+        axes            = (mm.get("axes") or [])[:3]
+        competitors     = (mm.get("competitors") or [])[:6]
+        differentiators = (mm.get("differentiators") or [])[:4]
+
+        if axes:
+            st.markdown("**Positioning Axes**")
+            st.write(", ".join(axes))
+        if competitors:
+            st.markdown("**Competitors**")
+            for c in competitors:
+                st.write(f"- {c}")
+        if differentiators:
+            st.markdown("**Differentiators**")
+            for d in differentiators:
+                st.write(f"- {d}")
+
+        # Export + Raw JSON tucked away
+        st.download_button(
+            "Download JSON",
+            json.dumps(data, indent=2),
+            file_name=f"{name}_ddlite.json",
+            use_container_width=True,
+        )
+        with st.expander("Show raw JSON"):
+            st.code(json.dumps(data, indent=2), language="json")
 
     # Always show the raw web signal sections
     render_section("Company Overview", overview_results, "No overview found. Try pasting the official site.")
