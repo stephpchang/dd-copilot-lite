@@ -7,8 +7,17 @@ from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich          # public enrichment (no keys)
 from app.funding_lookup import get_funding_data      # funding + investors (public/search-based)
 
-# ---- JSON schema for single-call output ----
-# NOTE: For OpenAI json_schema, any object with "properties" must have "required" listing ALL those props.
+# -------------------------
+# Streamlit app config
+# -------------------------
+st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="wide")
+st.title("Due Diligence Co-Pilot (Lite)")
+st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
+st.caption("Build: v0.5.0 – TAM + revenue + monetization")
+
+# -------------------------
+# JSON schema (OpenAI json_schema: every object with properties must list all in 'required')
+# -------------------------
 JSON_SCHEMA = {
     "name": "DDLite",
     "strict": True,
@@ -43,14 +52,14 @@ JSON_SCHEMA = {
             },
             "estimated_revenue": {
                 "type": "string",
-                "description": "Latest public estimate or guidance in USD with year/source if possible; else 'Not found'."
+                "description": "Latest public estimate/guidance in USD with metric + year/source; else 'Not found'."
             },
             "monetization": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "business_model": {"type": "string"},  # e.g., SaaS subscription, usage-based, ads, marketplace take-rate
-                    "revenue_streams": {"type": "array", "items": {"type": "string"}}  # e.g., 'Enterprise SaaS', 'API usage fees'
+                    "business_model": {"type": "string"},
+                    "revenue_streams": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["business_model", "revenue_streams"]
             },
@@ -133,14 +142,8 @@ def render_section(title, items, empty_hint):
             st.write(f"{ttl} — {snip}")
 
 # -------------------------
-# Streamlit app
+# UI state
 # -------------------------
-st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)")
-st.title("Due Diligence Co-Pilot (Lite)")
-st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.4.0-market-revenue-monetization")
-
-# Persist inputs
 for key, default in [
     ("company", ""),
     ("gen_summary", True),
@@ -165,7 +168,6 @@ with st.form("search_form", clear_on_submit=False):
 
     submitted = st.form_submit_button("Run", disabled=st.session_state.get("_busy", False))
 
-# Update state only on submit
 if submitted:
     st.session_state.company = (company_input or "").strip()
     st.session_state.gen_summary = gen_summary_input
@@ -183,7 +185,9 @@ if submitted and not name:
 if submitted and name:
     st.success(f"Profile for {name}")
 
+    # -------------------------
     # Gather web signals (no keys required)
+    # -------------------------
     with st.spinner("Gathering signals..."):
         overview_results = tidy(
             serp(f"{name} official site"),
@@ -205,7 +209,9 @@ if submitted and name:
     # Public-data enrichment (Wikipedia)
     wiki = wiki_enrich(name)  # {"title","url","summary"} or None
 
-    # ---- Funding & Investors (public/search-based) ----
+    # -------------------------
+    # Funding & Investors (public/search-based)
+    # -------------------------
     funding = get_funding_data(name, serp_func=lambda q, num=6: serp(q, num))
 
     st.subheader("Funding & Investors")
@@ -229,13 +235,14 @@ if submitted and name:
         st.markdown("**Notable investors**")
         st.write(", ".join(investors[:10]))
 
-    # Build a concise list of source URLs from signals + funding to anchor the model
+    # -------------------------
+    # Build grounding sources for the LLM
+    # -------------------------
     sources_list = []
     for coll in (overview_results, team_results, market_results, competition_results):
         for it in coll:
             if it.get("url"):
                 sources_list.append(it["url"])
-    # add wiki + funding sources
     if wiki and wiki.get("url"):
         sources_list.insert(0, wiki["url"])
     for s in (funding.get("sources") or []):
@@ -243,7 +250,9 @@ if submitted and name:
             sources_list.append(s)
     sources_list = list(dict.fromkeys(sources_list))[:10]  # de-dup & trim
 
+    # -------------------------
     # Single guarded OpenAI call (only if any AI section is requested)
+    # -------------------------
     data = None
     if gen_summary or gen_founder or gen_mmap:
         if not os.getenv("OPENAI_API_KEY"):
@@ -251,7 +260,6 @@ if submitted and name:
         else:
             st.session_state._busy = True
             try:
-                # include short background from Wikipedia if available
                 wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
 
                 prompt = f"""
@@ -270,7 +278,7 @@ Instructions:
 - For market_map: keep to 1–2 axes, 3–5 competitors, and 2–4 differentiators.
 - For market_size: give the most recent credible TAM figure with USD amount, region (global/region), source name, and year.
   If not found, return "Not found from public sources."
-- For estimated_revenue: return the most recent public revenue/gross bookings/ARR estimate in USD (state metric),
+- For estimated_revenue: return the most recent public revenue/ARR/gross bookings estimate in USD (state the metric),
   with year and source; if not found, return "Not found".
 - For monetization:
   - business_model: 1–2 lines (e.g., "SaaS subscription with usage-based pricing").
@@ -278,7 +286,7 @@ Instructions:
 - For sources: include up to 10 URLs with a short note; notes can be empty strings.
 
 Return ONLY the JSON object; no markdown, no commentary.
-                """.strip()
+""".strip()
 
                 with st.spinner("Generating structured brief..."):
                     data = generate_once(prompt, JSON_SCHEMA)
@@ -289,7 +297,9 @@ Return ONLY the JSON object; no markdown, no commentary.
             finally:
                 st.session_state._busy = False
 
-    # -------- Pretty summaries (with Raw JSON tucked away) --------
+    # -------------------------
+    # Pretty summaries (with Raw JSON tucked away)
+    # -------------------------
     if data:
         inv = (data.get("investor_summary") or "").strip()
         fb  = data.get("founder_brief") or {}
@@ -396,5 +406,27 @@ Return ONLY the JSON object; no markdown, no commentary.
     # Markdown export (no AI required)
     # -------------------------
     import datetime as dt
+
     def md_list(items):
-        return "\n".join(f"- {item}" for item in items)
+        # Expecting list of dicts with 'title','url','snippet'
+        return "\n".join(
+            f"- [{i.get('title','')}]({i.get('url','')}) — {i.get('snippet','')}"
+            for i in (items or [])
+        ) or "_No items_"
+
+    md = f"""# {name} — First-Pass Diligence
+_Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_
+
+## Overview
+{md_list(overview_results)}
+
+## Founding Team
+{md_list(team_results)}
+
+## Market
+{md_list(market_results)}
+
+## Competition
+{md_list(competition_results)}
+"""
+    st.download_button("Download snapshot (Markdown)", md, file_name=f"{name}_snapshot.md")
