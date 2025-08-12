@@ -42,7 +42,7 @@ JSON_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "url": {"type": "string", "format": "uri"},
+                        "url": {"type": "string"},   # <-- removed format: "uri"
                         "note": {"type": "string"}
                     },
                     "required": ["url"]
