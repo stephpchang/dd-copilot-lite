@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import streamlit as st
+from urllib.parse import urlparse
 
 from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich
@@ -14,7 +15,7 @@ from app.market_size import get_market_size
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.7.0 – tighter funding parse + TAM hints + centered layout")
+st.caption("Build: v0.7.1 – tighter funding parse + TAM hints + centered layout + grounded source ranking")
 
 # -------------------------
 # JSON schema (OpenAI json_schema requires listing all props in 'required')
@@ -141,6 +142,46 @@ def render_section(title, items, empty_hint):
             st.write(f"[{ttl}]({url}) — {snip}")
         else:
             st.write(f"{ttl} — {snip}")
+
+# -------------------------
+# Source reliability helpers (ranking)
+# -------------------------
+SOURCE_ALLOWLIST = (
+    "mckinsey.com", "bain.com", "bcg.com", "gartner.com", "forrester.com",
+    "idc.com", "ibisworld.com", "harvard.edu", "stanford.edu", "mit.edu",
+    "wikipedia.org", "crunchbase.com", "pitchbook.com", "ft.com", "wsj.com",
+    "bloomberg.com", "reuters.com", "economist.com", "g2.com", "capterra.com",
+)
+SOURCE_BLOCKLIST = (
+    "reddit.com", "quora.com", "fandom.com", "yahoo.com/answers",
+)
+
+def _domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def _source_rank(url: str) -> int:
+    d = _domain(url)
+    if not d:
+        return 1000
+    if any(blk in d for blk in SOURCE_BLOCKLIST):
+        return 900
+    for i, good in enumerate(SOURCE_ALLOWLIST):
+        if good in d:
+            return 100 + i  # closer to 100 is better
+    return 500  # neutral
+
+def _rank_and_dedup(urls):
+    seen = set()
+    uniq = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    uniq.sort(key=_source_rank)
+    return uniq
 
 # -------------------------
 # Funding helpers for Investor Summary
@@ -297,7 +338,7 @@ if submitted and name:
     market_size = get_market_size(name, serp_func=lambda q, num=6: serp(q, num))
 
     # -------------------------
-    # Build grounding sources for the LLM (include wiki, funding, TAM)
+    # Build grounding sources for the LLM (wiki + funding + TAM), ranked
     # -------------------------
     sources_list = []
     for coll in (overview_results, team_results, market_results, competition_results):
@@ -312,7 +353,9 @@ if submitted and name:
     for s in (market_size.get("sources") or []):
         if s:
             sources_list.append(s)
-    sources_list = list(dict.fromkeys(sources_list))[:10]  # de-dup & trim
+
+    # de-dup and rank by source quality
+    sources_list = _rank_and_dedup(sources_list)[:10]
 
     # -------------------------
     # Single guarded OpenAI call (only if any AI section is requested)
@@ -340,7 +383,7 @@ if submitted and name:
 Return ONE JSON object that matches the provided schema.
 Company: {name}
 Website: null
-User-provided sources: {sources_list}
+User-provided sources (ranked): {sources_list}
 
 Background (optional, from Wikipedia):
 {wiki_hint}
