@@ -23,31 +23,7 @@ _SEED: Dict[str, Dict[str, Any]] = {
                 "source": "https://www.theinformation.com/"
             }
         ],
-    },
-    "figma": {
-        "rounds": [
-            {
-                "round": "Series E",
-                "date": "2021-06-24",
-                "amount_usd": 200_000_000,
-                "lead_investors": ["Durable Capital Partners"],
-                "other_investors": ["Sequoia", "a16z", "Index"],
-                "source": "https://www.figma.com/blog/"
-            }
-        ],
-    },
-    "ramp": {
-        "rounds": [
-            {
-                "round": "Series D",
-                "date": "2024-05-01",
-                "amount_usd": 150_000_000,
-                "lead_investors": ["Khosla Ventures"],
-                "other_investors": ["Founders Fund", "Stripe"],
-                "source": "https://techcrunch.com/"
-            }
-        ],
-    },
+    }
 }
 
 # ----- Regex -----
@@ -56,24 +32,27 @@ _ROUND_PAT = re.compile(r"\b(pre[-\s]?seed|seed|series\s+[a-k]|growth|mezzanine|
 _AMOUNT_PAT = re.compile(
     r"""
     (?:
-        \$\s*(?P<num_commas>\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*(?P<unit_commas>billion|bn|b|million|mm|m|thousand|k)?
+        \$\s*(?P<num_commas>\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*(?P<unit_commas>trillion|tn|t|billion|bn|b|million|mm|m|thousand|k)?
     )
     |
     (?:
-        \$?\s*(?P<num_unit>\d+(?:\.\d+)?)\s*(?P<unit_only>billion|bn|b|million|mm|m|thousand|k)
+        \$?\s*(?P<num_unit>\d+(?:\.\d+)?)\s*(?P<unit_only>trillion|tn|t|billion|bn|b|million|mm|m|thousand|k)
     )
     """,
     re.I | re.X,
 )
 
-_POSITIVE_CONTEXT = re.compile(r"\b(raised|raises|raise|funding|round|series|financing|led by|investment round)\b", re.I)
+_POSITIVE_CONTEXT = re.compile(
+    r"\b(raised?|funding|round|series|financing|led by|investment round|fundraise|round of)\b",
+    re.I,
+)
 _NEGATIVE_CONTEXT = re.compile(r"\b(valuation|valued|market size|tam|sam|som|revenue|arr|sales|market cap|budget|capex|forecast)\b", re.I)
 _MONTH_NEAR_NUM = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\$?\d{1,2}\b", re.I)
 _LEAD_PAT = re.compile(r"\bled\s+by\s+([^.;,\n]+)", re.I)
 _DATE_PAT = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
-    r"Dec(?:ember)?)\s+\d{1,2},\s+\d{4}|\b\d{4}\b"
+    r"Dec(?:ember)?)\s+\d{1,2},\s+\d{4}|\b\d{4}\b|\b\d{4}-\d{2}-\d{2}\b"
 )
 
 def _norm_round(s: str) -> str:
@@ -99,11 +78,10 @@ def _to_usd(num_str: str, unit: Optional[str]) -> Optional[int]:
         elif u in ("million", "mm", "m"): mult = 1_000_000
         elif u in ("thousand", "k"):      mult = 1_000
     val = int(round(amt * mult))
-    # Filter: typical venture rounds are < $10B; drop outliers
+    # Venture rounds usually < $10B
     if val <= 0 or val > 10_000_000_000:
         return None
-    # Also drop tiny amounts (e.g., $23)
-    if val < 1_000_000:
+    if val < 1_000_000:  # drop tiny amounts like $23
         return None
     return val
 
@@ -147,6 +125,19 @@ def _parse_snippet(snippet: str, title: str) -> Dict[str, Any]:
     amt = _parse_amounts(text)
     if amt:
         out["amount_usd"] = amt
+
+    # If we found a round but no amount, try looser nearby amount capture
+    if out.get("round") and "amount_usd" not in out:
+        for m in _AMOUNT_PAT.finditer(text):
+            window = _near(text, *m.span(), radius=120)
+            if re.search(r"\b(series|round)\b", window, re.I):
+                if m.group("num_commas"):
+                    a2 = _to_usd(m.group("num_commas"), m.group("unit_commas"))
+                else:
+                    a2 = _to_usd(m.group("num_unit"), m.group("unit_only"))
+                if a2:
+                    out["amount_usd"] = a2
+                    break
 
     l = _LEAD_PAT.search(text)
     if l:
@@ -214,7 +205,7 @@ def get_funding_data(
         hits: List[Dict[str, str]] = []
         for q in queries:
             try:
-                hits.extend(serp_func(q, num=6))
+                hits.extend(serp_func(q, num=3))
             except Exception:
                 pass
 
