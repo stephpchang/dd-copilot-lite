@@ -1,8 +1,13 @@
 # app/funding_lookup.py
+# Lightweight funding parser from public snippets (SERP). Not a replacement for an official API.
+
+from __future__ import annotations
 import re
 from typing import Callable, Dict, List, Any, Optional
 
-# ----- Seed demo data -----
+# -------------------------
+# Seed demo data (used if SERP returns nothing useful)
+# -------------------------
 _SEED: Dict[str, Dict[str, Any]] = {
     "anthropic": {
         "rounds": [
@@ -22,13 +27,21 @@ _SEED: Dict[str, Dict[str, Any]] = {
                 "other_investors": ["Others"],
                 "source": "https://www.theinformation.com/"
             }
-        ],
+        ]
     }
 }
 
-# ----- Regex -----
-_ROUND_PAT = re.compile(r"\b(pre[-\s]?seed|seed|series\s+[a-k]|growth|mezzanine|bridge|venture|angel)\b", re.I)
+# -------------------------
+# Regex + parsing helpers
+# -------------------------
 
+# Round labels we care about
+_ROUND_PAT = re.compile(
+    r"\b(pre[-\s]?seed|seed|series\s+[a-k]|growth|mezzanine|bridge|venture|angel)\b",
+    re.I,
+)
+
+# Money amounts with optional units (e.g., $450M, $2.3B, $1,200,000,000)
 _AMOUNT_PAT = re.compile(
     r"""
     (?:
@@ -42,30 +55,46 @@ _AMOUNT_PAT = re.compile(
     re.I | re.X,
 )
 
+# Accept language that implies a funding round/raise
 _POSITIVE_CONTEXT = re.compile(
-    r"\b(raised?|funding|round|series|financing|led by|investment round|fundraise|round of)\b",
+    r"\b(raised?|raising|financing|funding|round|series|led by|investment round|fundraise|round of|closed)\b",
     re.I,
 )
-_NEGATIVE_CONTEXT = re.compile(r"\b(valuation|valued|market size|tam|sam|som|revenue|arr|sales|market cap|budget|capex|forecast)\b", re.I)
-_MONTH_NEAR_NUM = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\$?\d{1,2}\b", re.I)
-_LEAD_PAT = re.compile(r"\bled\s+by\s+([^.;,\n]+)", re.I)
+
+# Reject valuation/revenue/market-cap contexts to avoid swallowing those numbers
+_NEGATIVE_CONTEXT = re.compile(
+    r"\b(valuation|valued|post[-\s]?money|pre[-\s]?money|market\s*cap|market\s*capitalization|revenue|arr|sales|bookings|ebitda|budget|forecast)\b",
+    re.I,
+)
+
+# Dates we commonly see in snippets
 _DATE_PAT = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
     r"Dec(?:ember)?)\s+\d{1,2},\s+\d{4}|\b\d{4}\b|\b\d{4}-\d{2}-\d{2}\b"
 )
 
+# Heuristic: if a month appears right next to a small number, it's likely a day
+_MONTH_NEAR_NUM = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\$?\d{1,2}\b", re.I)
+
+# "led by <investor(s)>"
+_LEAD_PAT = re.compile(r"\bled\s+by\s+([^.;,\n]+)", re.I)
+
+
 def _norm_round(s: str) -> str:
-    s = s.lower().strip().replace("series ", "Series ").replace("seed", "Seed")
+    s = (s or "").strip().lower()
     if s.startswith("series "):
-        parts = s.split()
-        if len(parts) == 2:
-            return f"Series {parts[1].upper()}"
-    if s in ("pre seed", "pre-seed"): return "Pre-Seed"
-    if s == "seed": return "Seed"
-    return s.title()
+        # "series a" -> "Series A"
+        return "Series " + s.split()[-1].upper()
+    if s in ("pre seed", "pre-seed"):
+        return "Pre-Seed"
+    if s == "seed":
+        return "Seed"
+    return s.title()  # Growth, Mezzanine, etc.
+
 
 def _to_usd(num_str: str, unit: Optional[str]) -> Optional[int]:
+    """Convert '$450M' parts into integer USD with sanity guards."""
     try:
         amt = float(num_str.replace(",", ""))
     except Exception:
@@ -73,39 +102,60 @@ def _to_usd(num_str: str, unit: Optional[str]) -> Optional[int]:
     mult = 1
     if unit:
         u = unit.lower()
-        if u in ("trillion", "tn", "t"): mult = 1_000_000_000_000
-        elif u in ("billion", "bn", "b"): mult = 1_000_000_000
-        elif u in ("million", "mm", "m"): mult = 1_000_000
-        elif u in ("thousand", "k"):      mult = 1_000
+        if u in ("trillion", "tn", "t"):
+            mult = 1_000_000_000_000
+        elif u in ("billion", "bn", "b"):
+            mult = 1_000_000_000
+        elif u in ("million", "mm", "m"):
+            mult = 1_000_000
+        elif u in ("thousand", "k"):
+            mult = 1_000
     val = int(round(amt * mult))
-    # Venture rounds usually < $10B
-    if val <= 0 or val > 10_000_000_000:
-        return None
-    if val < 1_000_000:  # drop tiny amounts like $23
+
+    # Venture round sanity guard: keep realistic amounts only
+    # ($1M .. $5B]; avoid tiny numbers and giant valuation figures.
+    if not (1_000_000 <= val <= 5_000_000_000):
         return None
     return val
 
-def _near(text: str, start: int, end: int, radius: int = 80) -> str:
+
+def _near(text: str, start: int, end: int, radius: int = 120) -> str:
     a = max(0, start - radius)
     b = min(len(text), end + radius)
     return text[a:b]
+
 
 def _clean_lead_chunk(s: str) -> str:
     s = re.sub(r"\bwith participation from\b.*$", "", s, flags=re.I).strip()
     s = re.split(r"\band\b|,|;", s)[0].strip()
     return s
 
-def _parse_amounts(text: str) -> Optional[int]:
+
+def _parse_amounts_near_round(text: str, round_match: Optional[re.Match]) -> Optional[int]:
+    """
+    Accept amounts only when:
+      - near a detected round label (within ~120 chars) if we have one
+      - positive funding context is present
+      - negative contexts (valuation/revenue/etc.) are not present
+    """
     best = None
     for m in _AMOUNT_PAT.finditer(text):
         start, end = m.span()
         window = _near(text, start, end)
+
         if _NEGATIVE_CONTEXT.search(window):
             continue
         if not _POSITIVE_CONTEXT.search(window):
             continue
         if _MONTH_NEAR_NUM.search(window):
             continue
+
+        # if we have a round location, enforce proximity
+        if round_match:
+            rstart, rend = round_match.span()
+            if abs(start - rstart) > 120 and abs(end - rend) > 120:
+                continue
+
         if m.group("num_commas"):
             amt = _to_usd(m.group("num_commas"), m.group("unit_commas"))
         else:
@@ -114,44 +164,56 @@ def _parse_amounts(text: str) -> Optional[int]:
             best = max(best or 0, amt)
     return best
 
-def _parse_snippet(snippet: str, title: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    text = f"{title} {snippet}"
 
+def _parse_snippet(snippet: str, title: str) -> Dict[str, Any]:
+    """
+    Parse a single SERP item (title + snippet) into a possible round dict:
+    { round, amount_usd, date, lead_investors[] }
+    """
+    out: Dict[str, Any] = {}
+    text = f"{title or ''} {snippet or ''}"
+
+    # Round
     r = _ROUND_PAT.search(text)
     if r:
         out["round"] = _norm_round(r.group(1))
 
-    amt = _parse_amounts(text)
+    # Amount (strict rules)
+    amt = _parse_amounts_near_round(text, r)
     if amt:
         out["amount_usd"] = amt
 
-    # If we found a round but no amount, try looser nearby amount capture
+    # If round exists but no amount, allow one more *very close* pass
     if out.get("round") and "amount_usd" not in out:
         for m in _AMOUNT_PAT.finditer(text):
-            window = _near(text, *m.span(), radius=120)
-            if re.search(r"\b(series|round)\b", window, re.I):
-                if m.group("num_commas"):
-                    a2 = _to_usd(m.group("num_commas"), m.group("unit_commas"))
-                else:
-                    a2 = _to_usd(m.group("num_unit"), m.group("unit_only"))
-                if a2:
-                    out["amount_usd"] = a2
-                    break
+            window = _near(text, *m.span(), radius=90)
+            if _NEGATIVE_CONTEXT.search(window) or not _POSITIVE_CONTEXT.search(window):
+                continue
+            if m.group("num_commas"):
+                a2 = _to_usd(m.group("num_commas"), m.group("unit_commas"))
+            else:
+                a2 = _to_usd(m.group("num_unit"), m.group("unit_only"))
+            if a2:
+                out["amount_usd"] = a2
+                break
 
+    # Lead investor(s)
     l = _LEAD_PAT.search(text)
     if l:
         lead = _clean_lead_chunk(l.group(1))
         if lead:
             out["lead_investors"] = [lead]
 
+    # Date (loose)
     d = _DATE_PAT.search(text)
     if d:
         out["date"] = d.group(0)
 
     return out
 
+
 def _merge_round(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge two round dicts, preferring non-empty values and unioning lead investors."""
     out = dict(a)
     for k, v in b.items():
         if v in (None, "", [], {}):
@@ -168,7 +230,9 @@ def _merge_round(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = v
     return out
 
+
 def _dedupe_rounds(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate by round label (fallback to amount/date), keep largest amounts first."""
     rounds = [r for r in rounds if any(r.get(k) for k in ("round", "amount_usd", "date", "lead_investors"))]
     buckets: Dict[str, Dict[str, Any]] = {}
     for r in rounds:
@@ -178,13 +242,30 @@ def _dedupe_rounds(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: (x.get("amount_usd") or 0), reverse=True)
     return out
 
+
+# -------------------------
+# Public entry point
+# -------------------------
 def get_funding_data(
     company_name: str,
     serp_func: Optional[Callable[[str, int], List[Dict[str, str]]]] = None
 ) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "rounds": [
+            {"round": "Series C", "date": "May 23, 2023", "amount_usd": 450000000,
+             "lead_investors": ["Spark Capital"], "other_investors": [...], "source": "..."},
+            ...
+        ],
+        "investors": [...],
+        "sources": [...]
+      }
+    """
     name_key = (company_name or "").strip().lower()
     result: Dict[str, Any] = {"rounds": [], "investors": [], "sources": []}
 
+    # Seed (if we have a known example)
     if name_key in _SEED:
         rounds = _SEED[name_key]["rounds"]
         result["rounds"].extend(rounds)
@@ -195,6 +276,7 @@ def get_funding_data(
             if r.get("source") and r["source"] not in result["sources"]:
                 result["sources"].append(r["source"])
 
+    # SERP scraping/parsing (if a search function is provided)
     if serp_func:
         queries = [
             f"{company_name} raises funding round led by",
@@ -225,6 +307,8 @@ def get_funding_data(
 
         if parsed_rounds:
             merged = _dedupe_rounds(parsed_rounds)
+
+            # Merge with any seeded rounds by label
             existing_labels = {r.get("round") for r in result["rounds"] if r.get("round")}
             for r in merged:
                 if r.get("round") in existing_labels:
@@ -235,15 +319,16 @@ def get_funding_data(
                 else:
                     result["rounds"].append(r)
 
+            # Build investor list
             invs: List[str] = []
             for r in result["rounds"]:
                 invs.extend(r.get("lead_investors") or [])
                 invs.extend(r.get("other_investors") or [])
-            seen = set()
-            uniq: List[str] = []
+            seen = set(); uniq: List[str] = []
             for x in invs:
                 if x and x not in seen:
                     seen.add(x); uniq.append(x)
-            result["investors"] = uniq or result["investors"]
+            if uniq:
+                result["investors"] = uniq
 
     return result
