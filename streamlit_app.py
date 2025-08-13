@@ -387,7 +387,8 @@ Instructions:
 - For investor_summary: return 5 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
   The bullets MUST cover, in order:
   1) What the company does (one line).
-  2) Funding to date as a number (use the 'known funding facts' above) and the largest round with amount and date.
+  2) Funding to date in short format (e.g., "$1.0B"), plus the largest round in the form:
+   "Largest: <Round> <amount short> (<YYYY-MM-DD>)". Use the Known funding facts above verbatim.
   3) Lead investor(s).
   4) Market context (TAM/category positioning).
   5) 1–2 open diligence questions.
