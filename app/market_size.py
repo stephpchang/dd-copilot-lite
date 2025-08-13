@@ -1,10 +1,17 @@
 # app/market_size.py
 import re
 from typing import Dict, List, Any, Optional, Callable
+from urllib.parse import urlparse
 
 _AMOUNT = re.compile(r"(?:USD|\$)\s*([0-9][0-9,\.]*)\s*(trillion|tn|t|billion|bn|b|million|mm|m|thousand|k)?", re.I)
 _YEAR = re.compile(r"\b(20[0-3]\d|19\d{2})\b")
 _SCOPE = re.compile(r"\b(TAM|SAM|SOM|total addressable market|serviceable available market|serviceable obtainable market|market size|market value)\b", re.I)
+
+_TRUSTED = (
+    "mckinsey.com","bain.com","bcg.com","gartner.com","forrester.com",
+    "deloitte.com","statista.com","idc.com","ibisworld.com",
+    "ft.com","wsj.com","bloomberg.com","reuters.com","economist.com",
+)
 
 def _norm_amount(num: str, unit: Optional[str]) -> Optional[int]:
     try:
@@ -30,6 +37,13 @@ def _scope(text: str) -> str:
     if "serviceable available" in t or t == "sam": return "SAM"
     if "serviceable obtainable" in t or t == "som": return "SOM"
     return "Market size"
+
+def _is_trusted(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return any(d in host for d in _TRUSTED)
 
 def _parse_hit(h: Dict[str, str]) -> Dict[str, Any]:
     t = h.get("title") or ""
@@ -58,9 +72,10 @@ def get_market_size(company_name: str, serp_func: Callable[[str, int], List[Dict
     hits: List[Dict[str, str]] = []
     for q in queries:
         try:
-            hits.extend(serp_func(q, 6))
+            hits.extend(serp_func(q, 3))
         except Exception:
             pass
+
     estimates = []
     sources = []
     for h in hits:
@@ -69,9 +84,16 @@ def get_market_size(company_name: str, serp_func: Callable[[str, int], List[Dict
             estimates.append(p)
         if h.get("url"):
             sources.append(h["url"])
+
+    # Dedup sources
     seen = set(); uniq = []
     for s in sources:
         if s and s not in seen:
             seen.add(s); uniq.append(s)
-    estimates.sort(key=lambda x: x.get("amount_usd") or 0, reverse=True)
-    return {"estimates": estimates[:5], "sources": uniq[:10]}
+
+    # Prefer trusted sources; then sort by (year, amount)
+    trusted = [e for e in estimates if _is_trusted(e.get("url",""))]
+    picked = (trusted or estimates)
+    picked.sort(key=lambda x: (x.get("year") or "0000", x.get("amount_usd") or 0), reverse=True)
+
+    return {"estimates": picked[:5], "sources": uniq[:10]}
