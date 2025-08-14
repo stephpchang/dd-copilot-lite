@@ -2,11 +2,24 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import datetime
+from importlib.util import find_spec
 
 st.set_page_config(page_title="USV Thematic Deal Radar (MVP)", layout="wide")
 
 st.title("🚀 USV Thematic Deal Radar (MVP)")
 st.caption("Public-data demo: filter by thesis, stage, and amount; export results for outreach.")
+
+# ------------------------
+# Pick an Excel writer engine if available
+# ------------------------
+def _pick_excel_engine() -> str | None:
+    if find_spec("xlsxwriter"):
+        return "xlsxwriter"
+    if find_spec("openpyxl"):
+        return "openpyxl"
+    return None
+
+EXCEL_ENGINE = _pick_excel_engine()
 
 # ------------------------
 # Sample thematic data (curated for demo; replace/extend freely)
@@ -194,15 +207,18 @@ st.subheader("Export")
 csv = f.to_csv(index=False)
 st.download_button("Download CSV", csv, "usv_thematic_deals.csv", "text/csv", use_container_width=True)
 
-buf = BytesIO()
-with pd.ExcelWriter(buf, engine="XlsxWriter") as writer:
-    f.to_excel(writer, index=False)
-st.download_button(
-    "Download Excel",
-    buf.getvalue(),
-    "usv_thematic_deals.xlsx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+if EXCEL_ENGINE:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine=EXCEL_ENGINE) as writer:
+        f.to_excel(writer, index=False)
+    st.download_button(
+        f"Download Excel ({EXCEL_ENGINE})",
+        buf.getvalue(),
+        "usv_thematic_deals.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+else:
+    st.info("Excel export unavailable: add `XlsxWriter` or `openpyxl` to requirements.txt. CSV export works above.")
 
 st.caption("Demo data only. Real version can ingest press releases, SEC Form D, and job feeds to auto-refresh this list.")
