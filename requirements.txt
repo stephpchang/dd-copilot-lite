@@ -5,3 +5,4 @@ tenacity>=8.2
 python-dotenv>=1.0
 pandas
 XlsxWriter
+openpyxl
