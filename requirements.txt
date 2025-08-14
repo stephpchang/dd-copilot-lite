@@ -3,3 +3,5 @@ requests>=2.31
 openai>=1.40
 tenacity>=8.2
 python-dotenv>=1.0
+pandas
+XlsxWriter
