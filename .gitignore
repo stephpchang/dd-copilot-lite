@@ -1,3 +1,5 @@
 .env
 __pycache__/
 .ipynb_checkpoints/
+# app/.gitignore
+data/founder_scores.csv
