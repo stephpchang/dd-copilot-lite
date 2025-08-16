@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Due Diligence Co-Pilot (Lite) — Accordion UX + smarter (free) founder detection
+# Due Diligence Co-Pilot (Lite) — Accordion UX + founder detection + evidence table
 
 import os
 import re
@@ -8,7 +8,6 @@ import requests
 import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
-from collections import Counter, defaultdict
 
 # Existing modules
 from app.llm_guard import generate_once
@@ -25,7 +24,7 @@ from app.founder_scoring import auto_founder_scoring_panel
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.11.0 — Accordion UX + smarter founder detection")
+st.caption("Build: v0.11.1 — Accordion UX + founder detection evidence")
 
 # -------------------------------------------------
 # Google Custom Search (cached)
@@ -144,93 +143,6 @@ def render_section(title, items, empty_hint):
     for it in items:
         ttl=it.get("title") or "(no title)"; url=it.get("url") or ""; snip=it.get("snippet") or ""
         st.write(f"[{ttl}]({url}) - {snip}" if url else f"{ttl} - {snip}")
-
-# -------------------------------------------------
-# Founder detection (free) + manual override if needed
-# -------------------------------------------------
-NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
-
-def _extract_names(text: str) -> list[str]:
-    if not text: return []
-    blacklist = {"Inc", "LLC", "Ltd", "Series", "Founder", "CEO", "Co", "Cofounder", "Co-founder", "Founder/CEO"}
-    out=[]
-    for m in NAME_RE.findall(text):
-        parts = m.split()
-        if any(p in blacklist for p in parts): continue
-        if len(parts) > 3: continue
-        out.append(m.strip())
-    return out
-
-@st.cache_data(show_spinner=False, ttl=86400)
-def detect_founders_with_evidence(company: str):
-    if not company: 
-        return [], {}
-    queries = [
-        f"{company} founder",
-        f"{company} cofounder",
-        f"{company} CEO",
-        f"{company} founders",
-        f"{company} leadership",
-        f"site:linkedin.com/in {company} founder",
-        f"site:linkedin.com/company {company} about",
-        f"site:wikipedia.org {company} founder",
-        f"site:github.com {company} founder",
-        f"{company} press release founder",
-    ]
-    scores = Counter()
-    evidence = defaultdict(lambda: {"score": 0, "sources": set()})
-
-    for q in queries:
-        for item in serp(q, num=3):
-            ttl = item.get("title","")
-            sn  = item.get("snippet","")
-            url = item.get("url","")
-            dom = urlparse(url).netloc if url else ""
-            text = f"{ttl}. {sn}"
-            names = _extract_names(text)
-
-            boost = 3 if "founder" in q.lower() else 1
-            if "linkedin.com/in" in url: boost += 2
-            if "wikipedia.org" in url:   boost += 2
-            if "techcrunch.com" in url or "press" in url: boost += 1
-
-            for n in names:
-                scores[n] += boost
-                evidence[n]["score"] += boost
-                if dom: evidence[n]["sources"].add(dom)
-
-    ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
-    top_names = [name for name, _ in ranked][:3]
-
-    # Convert evidence to serializable dict
-    ev_dict = {
-        name: {
-            "score": evidence[name]["score"],
-            "sources": list(evidence[name]["sources"])[:3]
-        } for name in top_names
-    }
-    return top_names, ev_dict
-
-
-# --- Use in UI ---
-detected, evidence = detect_founders_with_evidence(name)
-founder_hint = ", ".join(detected) if detected else ""
-if not detected:
-    st.warning("No founders confidently detected from public snippets. You can type a founder name to guide scoring.")
-
-founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
-
-# Evidence table
-if evidence:
-    st.caption("Founder detection evidence (public sources):")
-    rows = []
-    for n, ev in evidence.items():
-        rows.append({
-            "Name": n,
-            "Score": ev["score"],
-            "Sources": ", ".join(ev["sources"])
-        })
-    st.table(rows)
 
 # -------------------------------------------------
 # JSON schema for the guarded single call (unchanged)
@@ -396,13 +308,95 @@ if submitted and name:
     sources_list = _dedup_list(sources_list)[:12]
 
     # -------------------------------------------------
-    # Founder detection (free) + manual override if needed
+    # Founder detection (free; adds evidence table) — ONLY after submit & name
     # -------------------------------------------------
-    detected = detect_founders(name)
+    NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
+
+    def _extract_names(text: str) -> list[str]:
+        if not text: return []
+        blacklist = {"Inc","LLC","Ltd","Series","Founder","CEO","Co","Cofounder","Co-founder","Founder/CEO"}
+        out=[]
+        for m in NAME_RE.findall(text):
+            parts = m.split()
+            if any(p in blacklist for p in parts): continue
+            if len(parts) > 3: continue
+            out.append(m.strip())
+        return out
+
+    @st.cache_data(show_spinner=False, ttl=86400)
+    def detect_founders_with_evidence(company: str):
+        """Return (top_names, evidence_dict[name] -> {score:int, sources:list[str]})"""
+        if not company: return [], {}
+        queries = [
+            f"{company} founder",
+            f"{company} cofounder",
+            f"{company} CEO",
+            f"{company} founders",
+            f"{company} leadership",
+            f"site:linkedin.com/in {company} founder",
+            f"site:linkedin.com/company {company} about",
+            f"site:wikipedia.org {company} founder",
+            f"site:github.com {company} founder",
+            f"{company} press release founder",
+        ]
+        from collections import Counter, defaultdict
+        from urllib.parse import urlparse as _up
+
+        scores = Counter()
+        evidence = defaultdict(lambda: {"score": 0, "sources": set()})
+
+        for q in queries:
+            for item in serp(q, num=3):
+                ttl = item.get("title","") or ""
+                sn  = item.get("snippet","") or ""
+                url = item.get("url","") or ""
+                dom = _up(url).netloc if url else ""
+                text = f"{ttl}. {sn}"
+                names = _extract_names(text)
+
+                boost = 3 if "founder" in q.lower() else 1
+                if "linkedin.com/in" in url: boost += 2
+                if "wikipedia.org"   in url: boost += 2
+                if "techcrunch.com"  in url or "press" in url: boost += 1
+
+                for n in names:
+                    scores[n] += boost
+                    evidence[n]["score"] += boost
+                    if dom: evidence[n]["sources"].add(dom)
+
+        ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
+        top_names = [nm for nm, _ in ranked][:3]
+
+        ev_dict = {
+            nm: {
+                "score": evidence[nm]["score"],
+                "sources": sorted(list(evidence[nm]["sources"]))[:3]
+            } for nm in top_names
+        }
+        return top_names, ev_dict
+
+    detected, ev_dict = detect_founders_with_evidence(name)
     founder_hint = ", ".join(detected) if detected else ""
     if not detected:
         st.warning("No founders confidently detected from public snippets. You can type a founder name to guide scoring.")
-    founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
+
+    founder_hint = st.text_input(
+        "Founder (optional — override or confirm)",
+        value=founder_hint,
+        help="Comma-separated if multiple."
+    )
+
+    # Evidence table (small)
+    if ev_dict:
+        st.caption("Founder detection evidence (public sources):")
+        ev_rows = []
+        for nm, ev in ev_dict.items():
+            ev_rows.append({
+                "Name": nm,
+                "Score": ev.get("score", 0),
+                "Sources": ", ".join(ev.get("sources", []))
+            })
+        st.table(ev_rows)
 
     # -------------------------------------------------
     # Founder Potential (automatic; no manual scoring)
@@ -410,12 +404,12 @@ if submitted and name:
     st.markdown("## Founder Potential")
     auto_founder_scoring_panel(
         company_name=name,
-        founder_hint=founder_hint or None,
+        founder_hint=(founder_hint or None),
         sources_list=sources_list,
         wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
         funding_stats=funding_stats,
         market_size=market_size,
-        persist_path=None   # set to "app/data/founder_scores.csv" to persist
+        persist_path=None   # set to "app/data/founder_scores.csv" to persist to CSV
     )
 
     # -------------------------------------------------
@@ -446,7 +440,7 @@ if submitted and name:
             st.write(", ".join(_dedup_list(investors[:10])))
 
     with st.expander("Investor Summary", expanded=False):
-        # Single guarded OpenAI call (if requested)
+        # Generate only if any AI section is enabled
         data = None
         if gen_summary or gen_founder or gen_mmap:
             if not os.getenv("OPENAI_API_KEY"):
@@ -566,7 +560,6 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.caption("LLM summary unavailable. See Signals section for public sources.")
 
     with st.expander("Founder Brief", expanded=False):
-        # Rendered from the JSON section if available; otherwise empty.
         st.caption("See Investor Summary → Founder Brief output when generated.")
 
     with st.expander("Market Map", expanded=False):
