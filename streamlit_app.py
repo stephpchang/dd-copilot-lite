@@ -1,94 +1,99 @@
+# streamlit_app.py
+# Due Diligence Co-Pilot (Lite)
+# v0.12.0 — Accordion UX + centered layout + robust founder detection + DDG fallback
+# Keeps original pipeline: funding_lookup, wiki_enrich, market_size, JSON LLM brief
+
 import os
 import re
 import sys
 import json
 import html
-import time
 import requests
 import streamlit as st
-from urllib.parse import urlparse as _up, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime
 
 # ---------------------------
-# Founder Potential module
+# Local modules (unchanged)
 # ---------------------------
+from app.llm_guard import generate_once
+from app.public_provider import wiki_enrich
+from app.funding_lookup import get_funding_data
+from app.market_size import get_market_size
+
+# Founder Potential auto panel
 try:
-    APP_ROOT = os.path.dirname(__file__)
-    if APP_ROOT not in sys.path:
-        sys.path.append(APP_ROOT)
     from app.founder_scoring import auto_founder_scoring_panel
 except Exception as e:
     auto_founder_scoring_panel = None
     _fp_import_err = str(e)
 
 # ---------------------------
-# Streamlit config
+# Streamlit config + layout
 # ---------------------------
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="wide")
+st.markdown(
+    """
+    <style>
+      .block-container { max-width: 980px; margin: auto; }
+      .stCaption { opacity: .75 }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.11.2 — Accordion UX + smarter founder detection + public search fallback")
+st.caption("Build: v0.12.0 — Accordion UX • centered • founder detection + evidence • public search fallback")
 
 # ===============================================================
-# SEARCH: Google CSE (preferred) -> DuckDuckGo HTML (fallback)
+# SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
 # ===============================================================
 @st.cache_data(show_spinner=False, ttl=86400)
 def serp(query: str, num: int = 3):
-    """
-    Returns a list of {title, snippet, url}.
-    Prefers Google CSE if GOOGLE_CSE_ID and GOOGLE_API_KEY are set.
-    Falls back to DuckDuckGo HTML parsing (no API key required).
-    """
+    """Return a list of dicts: {title, snippet, url}."""
     num = max(1, min(int(num or 3), 5))
 
-    # --- Preferred: Google CSE ---
+    # Try Google CSE if configured
     cx = os.getenv("GOOGLE_CSE_ID")
     key = os.getenv("GOOGLE_API_KEY")
     if cx and key:
         try:
-            resp = requests.get(
+            r = requests.get(
                 "https://www.googleapis.com/customsearch/v1",
                 params={"q": query, "cx": cx, "key": key, "num": num},
                 timeout=15,
             )
-            if resp.status_code == 200:
-                items = (resp.json().get("items") or [])[:num]
-                out = []
-                for it in items:
-                    out.append({
-                        "title": it.get("title", "") or "",
-                        "snippet": it.get("snippet", "") or "",
-                        "url": it.get("link", "") or "",
-                    })
-                if out:
-                    return out
+            if r.status_code == 200:
+                items = (r.json().get("items") or [])[:num]
+                return [{
+                    "title": it.get("title", "") or "",
+                    "snippet": it.get("snippet", "") or "",
+                    "url": it.get("link", "") or ""
+                } for it in items]
         except Exception:
-            pass  # fall through to DDG
+            pass  # fall through
 
-    # --- Fallback: DuckDuckGo HTML (no API key) ---
+    # Fallback: DuckDuckGo HTML (no API key)
     try:
-        r = requests.get("https://duckduckgo.com/html/", params={"q": query}, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-        })
+        r = requests.get(
+            "https://duckduckgo.com/html/",
+            params={"q": query},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
         html_text = r.text
-
-        # Find result blocks: links in /l/?uddg=... form
-        link_re = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-        snip_re = re.compile(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-
+        link_re = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S)
+        snip_re = re.compile(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', re.I | re.S)
         links = link_re.findall(html_text)
         snips = snip_re.findall(html_text)
 
-        results = []
+        out = []
         for i, (href, title_html) in enumerate(links[:num]):
-            # Extract final URL from DuckDuckGo redirect (/l/?uddg=<encoded_url>)
             url = href
             try:
                 if href.startswith("/l/?"):
                     q = parse_qs(urlparse(href).query)
-                    if "uddg" in q and q["uddg"]:
-                        url = q["uddg"][0]
-                    else:
-                        url = "https://duckduckgo.com" + href
+                    url = q.get("uddg", [f"https://duckduckgo.com{href}"])[0]
                 elif href.startswith("//"):
                     url = "https:" + href
                 elif href.startswith("/"):
@@ -96,63 +101,149 @@ def serp(query: str, num: int = 3):
             except Exception:
                 pass
 
-            # Clean title/snippet
             title = html.unescape(re.sub("<.*?>", "", title_html)).strip()
             snippet = ""
             if i < len(snips):
                 snippet = html.unescape(re.sub("<.*?>", "", snips[i])).strip()
-
-            results.append({"title": title, "snippet": snippet, "url": url})
-        return results[:num]
+            out.append({"title": title, "snippet": snippet, "url": url})
+        return out[:num]
     except Exception:
         return []
 
 # ===============================================================
-# NAME EXTRACTION (with location filter)
+# Helpers
+# ===============================================================
+def _domain(u: str) -> str:
+    try:
+        return urlparse(u).netloc.lower()
+    except Exception:
+        return ""
+
+def _abbr_usd(n):
+    try:
+        n = int(n)
+    except Exception:
+        return ""
+    if n >= 1_000_000_000_000: s = f"{n/1_000_000_000_000:.1f}T"
+    elif n >= 1_000_000_000:   s = f"{n/1_000_000_000:.1f}B"
+    elif n >= 1_000_000:       s = f"{n/1_000_000:.1f}M"
+    elif n >= 1_000:           s = f"{n/1_000:.0f}K"
+    else: return f"${n:,}"
+    return f"${s.rstrip('0').rstrip('.')}"
+
+def _fmt_date(s: str | None) -> str:
+    if not s: return ""
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y") if fmt == "%Y" else dt.strftime("%b %d, %Y")
+        except Exception:
+            pass
+    return s
+
+def _dedup_list(items):
+    seen=set(); out=[]
+    for x in items or []:
+        if x and x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+def tidy(results, prefer=(), limit=3):
+    seen=set(); cleaned=[]
+    for r in results or []:
+        url=r.get("url") or ""
+        ttl=(r.get("title") or "").lower()
+        if "search error" in ttl and not url:
+            cleaned.append(r); continue
+        if not url or url in seen: continue
+        seen.add(url); cleaned.append(r)
+    if prefer:
+        cleaned.sort(key=lambda x: any(p in (x.get("url") or "") for p in prefer), reverse=True)
+    return cleaned[:limit]
+
+# ===============================================================
+# Funding helpers (unchanged)
+# ===============================================================
+def _funding_stats(funding: dict) -> dict:
+    rounds = (funding or {}).get("rounds") or []
+    total = 0; largest=None; leads_all=[]
+    for r in rounds:
+        amt = r.get("amount_usd")
+        if isinstance(amt, int):
+            total += amt
+            if not largest or amt > (largest.get("amount_usd") or 0):
+                largest = {
+                    "round": r.get("round"),
+                    "date": r.get("date"),
+                    "amount_usd": amt,
+                    "lead": (", ".join(r.get("lead_investors") or []) or None),
+                }
+        leads_all.extend(r.get("lead_investors") or [])
+        leads_all.extend(r.get("other_investors") or [])
+    return {"total_usd": total if total>0 else None, "largest": largest, "lead_investors": _dedup_list(leads_all)[:6]}
+
+def funding_glance_sentence(stats: dict) -> str:
+    if not stats or not any(stats.values()): return "No public funding details found."
+    parts=[]; total=stats.get("total_usd")
+    if total: parts.append(f"Total {_abbr_usd(total)}")
+    largest = stats.get("largest") or {}
+    lr_round, lr_amt, lr_date = largest.get("round"), largest.get("amount_usd"), largest.get("date")
+    if lr_amt:
+        if lr_round and lr_date: parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)} ({_fmt_date(lr_date)})")
+        elif lr_round:           parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)}")
+        else:                    parts.append(f"Largest {_abbr_usd(lr_amt)}")
+    leads = stats.get("lead_investors") or []
+    if leads: parts.append("Leads " + ", ".join(leads[:5]))
+    return " · ".join(parts) if parts else "No public funding details found."
+
+# ===============================================================
+# Founder detection (robust)
 # ===============================================================
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
+
+BLACKLIST_TOKENS = {
+    "Inc","LLC","Ltd","Series","Founder","CEO","Co",
+    "Cofounder","Co-founder","Founder/CEO","University","College",
+    "Institute","Lab","Labs","School","Center","Research","Holdings",
+    "Capital","Ventures","Official","Profile","View","Press"
+}
+
+LOCATION_BLACKLIST = {
+    "San Francisco","New York","London","Boston","Los Angeles","Silicon Valley",
+    "United States","USA","California","Texas","Paris","Berlin","Toronto",
+    "Chicago","Miami","Seattle","Austin","Dublin","Bengaluru","Tokyo"
+}
 
 def _extract_names(text: str) -> list[str]:
     if not text:
         return []
-
-    # Disqualifying tokens
-    blacklist = {
-        "Inc","LLC","Ltd","Series","Founder","CEO","Co",
-        "Cofounder","Co-founder","Founder/CEO"
-    }
-
-    # Common non-person phrases (expand as needed)
-    location_blacklist = {
-        "San Francisco","New York","London","Boston","Los Angeles","Silicon Valley",
-        "United States","USA","California","Texas","Paris","Berlin","Toronto","Chicago","Miami","Seattle"
-    }
-
     out = []
     for m in NAME_RE.findall(text):
         candidate = m.strip()
         parts = candidate.split()
 
-        if any(p in blacklist for p in parts):
+        # Filter non-alpha tokens and too-short tokens
+        if any(len(p) < 2 or not p.isalpha() for p in parts):
             continue
-        if candidate in location_blacklist:
+
+        # Filter institutions / generic tokens
+        if any(p in BLACKLIST_TOKENS for p in parts):
             continue
+
+        # Filter locations or known non-person phrases
+        if candidate in LOCATION_BLACKLIST:
+            continue
+
         if len(parts) > 3:
             continue
 
         out.append(candidate)
     return out
 
-# ===============================================================
-# FOUNDER DETECTION with evidence (free)
-# ===============================================================
 @st.cache_data(show_spinner=False, ttl=86400)
 def detect_founders_with_evidence(company: str):
-    """
-    Returns (top_names, evidence_dict)
-      top_names: list[str]
-      evidence_dict: { name -> { score:int, sources:list[str] } }
-    """
+    """Return (top_names, evidence_dict[name] -> {score, sources})"""
     if not company:
         return [], {}
 
@@ -165,7 +256,6 @@ def detect_founders_with_evidence(company: str):
         f"site:linkedin.com/in {company} founder",
         f"site:linkedin.com/company {company} about",
         f"site:wikipedia.org {company} founder",
-        f"site:github.com {company} founder",
         f"{company} press release founder",
     ]
 
@@ -174,16 +264,14 @@ def detect_founders_with_evidence(company: str):
     evidence = defaultdict(lambda: {"score": 0, "sources": set()})
 
     for q in queries:
-        items = serp(q, num=3)
-        for item in items:
-            ttl = item.get("title", "") or ""
-            sn  = item.get("snippet", "") or ""
-            url = item.get("url", "") or ""
-            dom = _up(url).netloc if url else ""
+        for item in serp(q, num=3):
+            ttl = item.get("title","") or ""
+            sn  = item.get("snippet","") or ""
+            url = item.get("url","") or ""
+            dom = _domain(url)
             text = f"{ttl}. {sn}"
 
             names = _extract_names(text)
-
             boost = 3 if "founder" in q.lower() else 1
             if "linkedin.com/in" in url: boost += 2
             if "wikipedia.org"   in url: boost += 2
@@ -195,79 +283,350 @@ def detect_founders_with_evidence(company: str):
                 if dom:
                     evidence[n]["sources"].add(dom)
 
-    ranked = sorted(
-        scores.items(),
-        key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])),
-        reverse=True
-    )
-    top_names = [nm for nm, _ in ranked][:3]
+    ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
+    top = [nm for nm, _ in ranked][:3]
+    ev = {nm: {"score": evidence[nm]["score"], "sources": sorted(list(evidence[nm]["sources"]))[:3]} for nm in top}
+    return top, ev
 
-    ev_dict = {
-        nm: {
-            "score": evidence[nm]["score"],
-            "sources": sorted(list(evidence[nm]["sources"]))[:3]
-        } for nm in top_names
+# ===============================================================
+# JSON schema for the guarded OpenAI brief (unchanged)
+# ===============================================================
+JSON_SCHEMA = {
+    "name": "DDLite",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "investor_summary": {"type": "string"},
+            "founder_brief": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "founders": {"type": "array", "items": {"type": "string"}},
+                    "highlights": {"type": "array", "items": {"type": "string"}},
+                    "open_questions": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["founders", "highlights", "open_questions"]
+            },
+            "market_map": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "axes": {"type": "array", "items": {"type": "string"}},
+                    "competitors": {"type": "array", "items": {"type": "string"}},
+                    "differentiators": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["axes", "competitors", "differentiators"]
+            },
+            "market_size": {"type": "string"},
+            "estimated_revenue": {"type": "string"},
+            "monetization": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "business_model": {"type": "string"},
+                    "revenue_streams": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["business_model", "revenue_streams"]
+            },
+            "sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "url": {"type": "string"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["url", "note"]
+                }
+            }
+        },
+        "required": [
+            "investor_summary",
+            "founder_brief",
+            "market_map",
+            "market_size",
+            "estimated_revenue",
+            "monetization",
+            "sources"
+        ]
     }
-    return top_names, ev_dict
+}
 
 # ===============================================================
-# SIMPLE UI (Accordion + Evidence + Auto Scoring)
+# UI state & form
 # ===============================================================
+for key, default in [
+    ("company",""),
+    ("gen_summary", True),
+    ("gen_founder_brief", True),
+    ("gen_market_map", True),
+    ("_busy", False),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 with st.form("company_form", clear_on_submit=False):
-    name = st.text_input("Company name", "")
-    submitted = st.form_submit_button("Run")
+    company_input = st.text_input("Company name", value=st.session_state.company)
+    examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
+    ex = st.selectbox("Or pick an example", examples, index=0)
+    if ex: company_input = ex
 
+    gen_summary_input   = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
+    gen_founder_input   = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
+    gen_marketmap_input = st.checkbox("Generate Market Map (OpenAI)", value=st.session_state.gen_market_map)
+
+    submitted = st.form_submit_button("Run", use_container_width=True)
+
+if submitted:
+    st.session_state.company = (company_input or "").strip()
+    st.session_state.gen_summary = gen_summary_input
+    st.session_state.gen_founder_brief = gen_founder_input
+    st.session_state.gen_market_map = gen_marketmap_input
+
+name = st.session_state.company
 if submitted and not name:
     st.warning("Please enter a company name to continue.")
 
+# ===============================================================
+# Main flow after submit
+# ===============================================================
 if submitted and name:
-    # --- Founder detection (only after submit) ---
-    detected, ev_dict = detect_founders_with_evidence(name)
+    st.success(f"Profile for {name}")
+
+    # --- Gather signals
+    with st.spinner("Gathering public signals..."):
+        overview_results = tidy(serp(f"{name} official site"), prefer=("about","wikipedia.org","crunchbase.com","linkedin.com"))
+        team_results     = tidy(serp(f"{name} founders team leadership"), prefer=("about","team","wikipedia.org","linkedin.com","crunchbase.com"))
+        market_results   = tidy(serp(f"{name} target market TAM customers industry"), prefer=("gartner.com","forrester.com","mckinsey.com","bain.com"))
+        competition_results = tidy(serp(f"{name} competitors alternatives comparative"), prefer=("g2.com","capterra.com","crunchbase.com","wikipedia.org"))
+
+    wiki = wiki_enrich(name)  # {"title","url","summary"} or None
+
+    funding = get_funding_data(name, serp_func=lambda q, num=3: serp(q, num))
+    funding_stats = _funding_stats(funding)
+
+    market_size = get_market_size(name, serp_func=lambda q, num=3: serp(q, num))
+    def _best_tam_line(ms: dict) -> str:
+        ests = (ms or {}).get("estimates") or []
+        if not ests: return "Market context: TAM not found from trusted public sources."
+        best = ests[0]; amt = _abbr_usd(best.get("amount_usd")); year = best.get("year") or ""
+        src = best.get("url") or ""; host = _domain(src)
+        tail = f" ({year}, {host})" if (year or host) else ""
+        return f"Market context: TAM of {amt}{tail}."
+    market_context_line = _best_tam_line(market_size)
+
+    # --- Build sources for LLM grounding
+    sources_list=[]
+    for coll in (overview_results, team_results, market_results, competition_results):
+        for it in coll:
+            if it.get("url"): sources_list.append(it["url"])
+    if wiki and wiki.get("url"): sources_list.insert(0, wiki["url"])
+    for s in (funding.get("sources") or []):       sources_list.append(s)
+    for s in (market_size.get("sources") or []):   sources_list.append(s)
+    sources_list = _dedup_list(sources_list)[:12]
+
+    # --- Founder detection (robust) + evidence + manual override
+    detected, evidence = detect_founders_with_evidence(name)
     founder_hint = ", ".join(detected) if detected else ""
-    if not detected:
-        st.warning("No founders confidently detected from public snippets. You can type a founder name to guide scoring.")
-
-    founder_hint = st.text_input("Founder (optional — override or confirm)",
-                                 value=founder_hint,
-                                 help="Comma-separated if multiple.")
-
-    if ev_dict:
+    founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
+    if evidence:
         st.caption("Founder detection evidence (public sources):")
-        rows = []
-        for nm, ev in ev_dict.items():
-            rows.append({
-                "Name": nm,
-                "Score": ev.get("score", 0),
-                "Sources": ", ".join(ev.get("sources", []))
-            })
+        rows = [{"Name": nm, "Score": evidence[nm]["score"], "Sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
         st.table(rows)
 
-    # --- Founder Potential (automatic) ---
+    # --- Founder Potential (automatic)
     st.markdown("## Founder Potential")
     if auto_founder_scoring_panel:
-        # Pass minimal empty structures for now (your upstream modules can enrich later)
         auto_founder_scoring_panel(
             company_name=name,
             founder_hint=(founder_hint or None),
-            sources_list=[],       # you can wire in search sources later
-            wiki_summary="",       # optional: feed wiki snippet
-            funding_stats={},      # optional: feed funding summary
-            market_size=None,      # optional: feed TAM hints
-            persist_path=None
+            sources_list=sources_list,
+            wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
+            funding_stats=funding_stats,
+            market_size=market_size,
+            persist_path=None,
         )
     else:
         st.error(f"Founder scoring module not found: {_fp_import_err}")
 
-    # --- Accordion sections (placeholders to keep your structure) ---
-    with st.expander("Funding & Investors", expanded=False):
-        st.caption("Wire in your funding parser here (rounds, investors, ‘at a glance’).")
+    # -------------------------------
+    # Accordion sections (full stack)
+    # -------------------------------
+    with st.expander("Funding & Investors", expanded=True):
+        rounds = funding.get("rounds") or []
+        investors = funding.get("investors") or []
+        st.subheader("Funding & Investors")
+        if rounds:
+            table_rows = []
+            for r in rounds[:10]:
+                table_rows.append({
+                    "Round": r.get("round") or "",
+                    "Date": _fmt_date(r.get("date")),
+                    "Amount": _abbr_usd(r.get("amount_usd")) if r.get("amount_usd") else "",
+                    "Lead": ", ".join(_dedup_list(r.get("lead_investors") or [])),
+                })
+            st.table(table_rows)
+            st.text(f"Funding at a glance: {funding_glance_sentence(funding_stats)}")
+            st.caption("Note: Public-source parse; amounts reflect reported round sizes (not valuations).")
+        else:
+            st.caption("No funding data found yet (public sources).")
+        if investors:
+            st.markdown("**Notable investors**")
+            st.write(", ".join(_dedup_list(investors[:12])))
+
     with st.expander("Investor Summary", expanded=False):
-        st.caption("Your structured LLM brief (investor summary) can render here.")
+        data = None
+        gen_any = st.session_state.gen_summary or st.session_state.gen_founder_brief or st.session_state.gen_market_map
+        if gen_any:
+            if not os.getenv("OPENAI_API_KEY"):
+                st.info("Set OPENAI_API_KEY in Streamlit Secrets to enable AI sections.")
+            else:
+                st.session_state._busy = True
+                try:
+                    wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
+                    ms_hints = []
+                    for e in (market_size.get("estimates") or [])[:3]:
+                        amt = e.get("amount_usd"); year = e.get("year") or "n/a"; scope = e.get("scope") or "Market size"
+                        if amt: ms_hints.append(f"- {scope}: {_abbr_usd(amt)} ({year})")
+                    ms_hints_txt = "\n".join(ms_hints) if ms_hints else "- None found"
+
+                    prompt = f"""
+Return ONE JSON object that matches the provided schema.
+Company: {name}
+Website: null
+User-provided sources: {sources_list}
+
+Background (optional, from Wikipedia):
+{wiki_hint}
+
+Known funding facts (parsed from public sources; prefer these over guessing):
+- Total funding (USD): {funding_stats.get('total_usd') if funding_stats.get('total_usd') else 'unknown'}
+- Largest round: {((funding_stats.get('largest') or {}).get('round')) or 'unknown'}
+- Largest round amount: {((funding_stats.get('largest') or {}).get('amount_usd')) or 'unknown'}
+- Largest round date: {((funding_stats.get('largest') or {}).get('date')) or 'unknown'}
+- Lead investor(s): {', '.join(funding_stats.get('lead_investors') or []) or 'unknown'}
+
+Known market size indications (from public snippets):
+{ms_hints_txt}
+
+Instructions:
+- Only use fields defined in the schema and keep them concise.
+- For investor_summary: return 5 bullets as plain text, each starting with "- " on a NEW LINE (no numbering).
+  The bullets MUST cover, in order:
+  1) What the company does (one line).
+  2) Funding to date in short format (e.g., "$1.0B"), and the largest round as:
+     "Largest: <Round> <amount short> (<YYYY-MM-DD>)". Use the Known funding facts above verbatim when available.
+  3) Lead investor(s).
+  4) Market context (TAM/category positioning).
+  5) 1–2 open diligence questions.
+- For founder_brief: founders as "Name - 1–2 sentence bio (role + notable facts)"; plus highlights and open_questions.
+- For market_map: 1–2 axes, 3–5 competitors, 2–4 differentiators.
+- For market_size: most recent credible TAM (USD + region + source + year). If unknown, say "Not found from public sources."
+- For estimated_revenue: most recent public revenue/ARR/gross bookings (USD + metric + year + source). If unknown, say "Not found".
+- For monetization: short business_model + 2–5 revenue_streams.
+- For sources: include up to 10 URLs with a short note; notes can be empty strings.
+Return ONLY the JSON object; no markdown, no commentary.
+""".strip()
+
+                    data = generate_once(prompt, JSON_SCHEMA)
+                except Exception as e:
+                    st.error("There was a problem generating the brief. Showing public signals instead.")
+                    data = None
+                finally:
+                    st.session_state._busy = False
+
+        if data:
+            inv = (data.get("investor_summary") or "").strip()
+            src = data.get("sources") or []
+
+            # bulletize and patch bullet #2 with verified funding stats
+            lines = [ln.strip() for ln in inv.replace("\r", "").split("\n") if ln.strip()] if inv else []
+            bullets = []
+            for b in (lines or []):
+                b = b.lstrip("•- ").strip()
+                if not b.endswith((".", "?", "!")): b += "."
+                bullets.append(b)
+
+            # ensure funding bullet is consistent
+            try:
+                total = funding_stats.get("total_usd")
+                largest = funding_stats.get("largest") or {}
+                lr_round = largest.get("round"); lr_amt = largest.get("amount_usd"); lr_date = largest.get("date")
+                parts = [f"Funding to date: {_abbr_usd(total) or 'unknown'}."]
+                if lr_amt:
+                    if lr_round and lr_date: parts.append(f"Largest: {lr_round} {_abbr_usd(lr_amt)} ({_fmt_date(lr_date)}).")
+                    elif lr_round:            parts.append(f"Largest: {lr_round} {_abbr_usd(lr_amt)}.")
+                    else:                     parts.append(f"Largest: {_abbr_usd(lr_amt)}.")
+                b2 = " ".join(parts)
+                if len(bullets) >= 2: bullets[1] = b2
+                elif bullets: bullets.insert(1, b2)
+                else: bullets = [b2]
+            except Exception:
+                pass
+
+            # force market context line
+            if market_context_line:
+                if len(bullets) >= 4: bullets[3] = market_context_line
+                else: bullets.append(market_context_line)
+
+            for b in bullets[:7]:
+                st.write(f"- {b}")
+
+            # Source links
+            if src:
+                links = []
+                for s in src[:8]:
+                    u = s.get("url",""); note = (s.get("note") or "").strip()
+                    if not u: continue
+                    label = note or _domain(u) or "source"
+                    links.append(f"[{label}]({u})")
+                if links:
+                    st.markdown("**Sources:** " + " · ".join(links))
+        else:
+            st.caption("LLM summary unavailable. See Signals section for public sources.")
+
     with st.expander("Founder Brief", expanded=False):
-        st.caption("Founder bios/highlights/open questions (from LLM brief).")
+        st.caption("See Investor Summary → Founder Brief output when generated.")
+
     with st.expander("Market Map", expanded=False):
-        st.caption("Axes, competitors, differentiators (from LLM brief).")
+        st.caption("See Investor Summary → Market Map output when generated.")
+
     with st.expander("Market Size & Revenue", expanded=False):
-        st.caption("Most recent TAM and revenue estimates (from public sources).")
+        st.write(market_context_line)
+
     with st.expander("Signals (public sources)", expanded=False):
-        st.caption("Render raw search results here if desired (overview/team/market/competition).")
+        def _render(title, items, empty_hint):
+            st.subheader(title)
+            if not items:
+                st.caption(empty_hint); return
+            for it in items:
+                ttl=it.get("title") or "(no title)"; u=it.get("url") or ""; sn=it.get("snippet") or ""
+                st.write(f"[{ttl}]({u}) - {sn}" if u else f"{ttl} - {sn}")
+        _render("Company Overview", overview_results, "No overview found.")
+        _render("Founding Team",    team_results,     "No team info found.")
+        _render("Market",           market_results,   "No market info found.")
+        _render("Competition",      competition_results, "No competition info found.")
+
+        # Markdown snapshot export
+        import datetime as dt
+        def md_list(items):
+            return "\n".join(f"- [{i.get('title','')}]({i.get('url','')}) - {i.get('snippet','')}" for i in (items or [])) or "_No items_"
+        md = f"""# {name} — First-Pass Diligence
+_Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_
+
+## Overview
+{md_list(overview_results)}
+
+## Founding Team
+{md_list(team_results)}
+
+## Market
+{md_list(market_results)}
+
+## Competition
+{md_list(competition_results)}
+"""
+        st.download_button("Download snapshot (Markdown)", md, file_name=f"{name}_snapshot.md", use_container_width=True)
