@@ -146,13 +146,12 @@ def render_section(title, items, empty_hint):
         st.write(f"[{ttl}]({url}) - {snip}" if url else f"{ttl} - {snip}")
 
 # -------------------------------------------------
-# Founder detection (free; uses CSE titles/snippets)
+# Founder detection (free) + manual override if needed
 # -------------------------------------------------
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 
 def _extract_names(text: str) -> list[str]:
     if not text: return []
-    # Filter out generic words that pass the regex
     blacklist = {"Inc", "LLC", "Ltd", "Series", "Founder", "CEO", "Co", "Cofounder", "Co-founder", "Founder/CEO"}
     out=[]
     for m in NAME_RE.findall(text):
@@ -163,8 +162,9 @@ def _extract_names(text: str) -> list[str]:
     return out
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def detect_founders(company: str) -> list[str]:
-    if not company: return []
+def detect_founders_with_evidence(company: str):
+    if not company: 
+        return [], {}
     queries = [
         f"{company} founder",
         f"{company} cofounder",
@@ -178,28 +178,59 @@ def detect_founders(company: str) -> list[str]:
         f"{company} press release founder",
     ]
     scores = Counter()
-    evidence_hits = defaultdict(int)
+    evidence = defaultdict(lambda: {"score": 0, "sources": set()})
 
     for q in queries:
         for item in serp(q, num=3):
             ttl = item.get("title","")
             sn  = item.get("snippet","")
             url = item.get("url","")
+            dom = urlparse(url).netloc if url else ""
             text = f"{ttl}. {sn}"
             names = _extract_names(text)
-            # Heuristic weighting: exact "founder" queries count more
+
             boost = 3 if "founder" in q.lower() else 1
             if "linkedin.com/in" in url: boost += 2
             if "wikipedia.org" in url:   boost += 2
             if "techcrunch.com" in url or "press" in url: boost += 1
+
             for n in names:
                 scores[n] += boost
-                evidence_hits[n] += 1
+                evidence[n]["score"] += boost
+                if dom: evidence[n]["sources"].add(dom)
 
-    # Rank by score then evidence diversity
-    ranked = sorted(scores.items(), key=lambda kv: (kv[1], evidence_hits[kv[0]]), reverse=True)
-    result = [name for name, _ in ranked][:3]
-    return result
+    ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
+    top_names = [name for name, _ in ranked][:3]
+
+    # Convert evidence to serializable dict
+    ev_dict = {
+        name: {
+            "score": evidence[name]["score"],
+            "sources": list(evidence[name]["sources"])[:3]
+        } for name in top_names
+    }
+    return top_names, ev_dict
+
+
+# --- Use in UI ---
+detected, evidence = detect_founders_with_evidence(name)
+founder_hint = ", ".join(detected) if detected else ""
+if not detected:
+    st.warning("No founders confidently detected from public snippets. You can type a founder name to guide scoring.")
+
+founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
+
+# Evidence table
+if evidence:
+    st.caption("Founder detection evidence (public sources):")
+    rows = []
+    for n, ev in evidence.items():
+        rows.append({
+            "Name": n,
+            "Score": ev["score"],
+            "Sources": ", ".join(ev["sources"])
+        })
+    st.table(rows)
 
 # -------------------------------------------------
 # JSON schema for the guarded single call (unchanged)
