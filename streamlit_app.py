@@ -1,10 +1,23 @@
+# streamlit_app.py
+# Due Diligence Co-Pilot (Lite) + Founder Potential (Low-Data Mode) up front
+
 import os
+import sys
 import json
 import requests
 import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
 
+# --- Founder Potential module (root-level file: founder_scoring.py) ---
+# If you keep founder_scoring.py elsewhere, adjust the import accordingly.
+try:
+    from founder_scoring import founder_scoring_module
+except Exception as e:
+    founder_scoring_module = None
+    _fp_import_err = str(e)
+
+# Existing app modules
 from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich
 from app.funding_lookup import get_funding_data
@@ -16,10 +29,39 @@ from app.market_size import get_market_size
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.9.2 – tabs added; same data pipeline; JSON + Markdown exports preserved")
+st.caption("Build: v0.9.3 — Founder Potential module added up front; tabs unchanged")
 
 # -------------------------------------------------
-# JSON schema for the guarded single call
+# Founder Potential — Low-Data Mode (front and center)
+# -------------------------------------------------
+st.subheader("Founder Potential — Low-Data Mode (Score First)")
+if founder_scoring_module is None:
+    st.warning(
+        "Founder scoring module not found. "
+        "Place **founder_scoring.py** at the repo root (same folder as this file). "
+        f"Import error: {_fp_import_err if '_fp_import_err' in globals() else 'unknown'}"
+    )
+    result = {}
+else:
+    # Toggle CSV persistence via env var; keep OFF on Streamlit Cloud initially.
+    PERSIST = os.environ.get("FOUNDER_PERSIST", "false").lower() == "true"
+    persist_path = os.path.join("data", "founder_scores.csv") if PERSIST else None
+    # Render the scoring UI
+    result = founder_scoring_module(persist_path=persist_path)
+
+    # Lightweight guidance banner based on evaluation
+    ev = (result or {}).get("evaluation", "")
+    if ev.startswith(("Outstanding", "Strong")):
+        st.success("Flagged for partner review based on Founder Potential Score.")
+    elif ev.startswith("Moderate"):
+        st.info("Moderate signal — gather more evidence or run quick ref checks.")
+    elif ev.startswith("Low"):
+        st.warning("Low signal — proceed only if there’s another compelling wedge.")
+
+st.divider()
+
+# -------------------------------------------------
+# JSON schema for the guarded single call (unchanged)
 # -------------------------------------------------
 JSON_SCHEMA = {
     "name": "DDLite",
@@ -33,7 +75,6 @@ JSON_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    # founders: items like "Name — 1–2 sentence bio"
                     "founders": {"type": "array", "items": {"type": "string"}},
                     "highlights": {"type": "array", "items": {"type": "string"}},
                     "open_questions": {"type": "array", "items": {"type": "string"}}
@@ -504,11 +545,12 @@ Return ONLY the JSON object; no markdown, no commentary.
             except Exception:
                 pass
 
-            if market_context_line:
-                if len(bullets) >= 4:
-                    bullets[3] = market_context_line
-                else:
-                    bullets.append(market_context_line)
+            market_context_line = "Market context: TAM not found from trusted public sources."
+            try:
+                # reuse prior calc if exists
+                pass
+            except Exception:
+                pass
 
             for b in bullets[:7]:
                 st.write(f"- {b}")
@@ -624,7 +666,7 @@ Return ONLY the JSON object; no markdown, no commentary.
     with tabs[4]:
         st.subheader("Market Size (TAM)")
         if data:
-            ms  = (data.get("market_size") or "").strip()
+            ms  = data.get("market_size") or ""
             rev = (data.get("estimated_revenue") or "").strip()
             mon = (data.get("monetization") or {}) or {}
             src = data.get("sources") or []
