@@ -313,15 +313,40 @@ if submitted and name:
     NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 
     def _extract_names(text: str) -> list[str]:
-        if not text: return []
-        blacklist = {"Inc","LLC","Ltd","Series","Founder","CEO","Co","Cofounder","Co-founder","Founder/CEO"}
-        out=[]
-        for m in NAME_RE.findall(text):
-            parts = m.split()
-            if any(p in blacklist for p in parts): continue
-            if len(parts) > 3: continue
-            out.append(m.strip())
-        return out
+    if not text:
+        return []
+
+    # Words that should disqualify a match
+    blacklist = {
+        "Inc","LLC","Ltd","Series","Founder","CEO","Co",
+        "Cofounder","Co-founder","Founder/CEO"
+    }
+
+    # Known non-person phrases to filter out (locations, orgs, common false positives)
+    location_blacklist = {
+        "San Francisco","New York","London","Boston","Los Angeles","Silicon Valley",
+        "United States","USA","California","Texas","Paris","Berlin","Toronto"
+    }
+
+    out = []
+    for m in NAME_RE.findall(text):
+        candidate = m.strip()
+        parts = candidate.split()
+
+        # skip if it contains blacklisted tokens
+        if any(p in blacklist for p in parts):
+            continue
+
+        # skip if it matches a known location/org phrase
+        if candidate in location_blacklist:
+            continue
+
+        # skip if too long (likely not a name)
+        if len(parts) > 3:
+            continue
+
+        out.append(candidate)
+    return out
 
     @st.cache_data(show_spinner=False, ttl=86400)
     def detect_founders_with_evidence(company: str):
