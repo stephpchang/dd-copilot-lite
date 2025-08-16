@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Due Diligence Co-Pilot (Lite) + Auto Founder Potential panel (no manual inputs)
+# Due Diligence Co-Pilot (Lite) + Automatic Founder Potential panel
 
 import os
 import json
@@ -8,26 +8,161 @@ import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
 
-# Existing app modules
+# Existing modules
 from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich
 from app.funding_lookup import get_funding_data
 from app.market_size import get_market_size
 
-# NEW: auto founder scoring panel (no manual inputs)
+# Auto founder scoring panel (no manual inputs)
 from app.founder_scoring import auto_founder_scoring_panel
 
-# -------------------------------------------------
-# App config
-# -------------------------------------------------
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.10.0 — Auto Founder Potential panel (no manual scoring)")
+st.caption("Build: v0.10.2 — Founder Potential panel (automatic)")
 
-# -------------------------------------------------
-# JSON schema for the guarded single call
-# -------------------------------------------------
+# ---------------- Google Custom Search (cached) ----------------
+@st.cache_data(show_spinner=False, ttl=86400)
+def serp(q, num=3):
+    cx = os.getenv("GOOGLE_CSE_ID")
+    key = os.getenv("GOOGLE_API_KEY")
+    if not cx or not key:
+        return []
+    num = min(num, 3)
+    resp = requests.get(
+        "https://www.googleapis.com/customsearch/v1",
+        params={"q": q, "cx": cx, "key": key, "num": num},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return [{"title": f"Search error {resp.status_code}", "snippet": resp.text[:200],
+                 "url": "https://developers.google.com/custom-search/v1/overview"}]
+    items = (resp.json().get("items") or [])[:num]
+    return [{"title": it.get("title",""), "snippet": it.get("snippet",""), "url": it.get("link","")} for it in items]
+
+# ---------------- Helpers ----------------
+def _domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def _abbr_usd(n):
+    try:
+        n = int(n)
+    except Exception:
+        return ""
+    if n >= 1_000_000_000_000:
+        s = f"{n/1_000_000_000_000:.1f}T"
+    elif n >= 1_000_000_000:
+        s = f"{n/1_000_000_000:.1f}B"
+    elif n >= 1_000_000:
+        s = f"{n/1_000_000:.1f}M"
+    elif n >= 1_000:
+        s = f"{n/1_000:.0f}K"
+    else:
+        return f"${n:,}"
+    s = s.rstrip("0").rstrip(".")
+    return f"${s}"
+
+def _fmt_usd_full(n):
+    try:
+        return f"${int(n):,}"
+    except Exception:
+        return ""
+
+def _dedup_list(items):
+    seen = set(); out=[]
+    for x in items or []:
+        if x and x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+def _fmt_date(s: str | None) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if fmt == "%Y":
+                return dt.strftime("%Y")
+            return dt.strftime("%b %d, %Y")
+        except Exception:
+            continue
+    return s
+
+# ---------------- Funding helpers ----------------
+def _funding_stats(funding: dict) -> dict:
+    rounds = (funding or {}).get("rounds") or []
+    total = 0
+    largest = None
+    leads_all = []
+    for r in rounds:
+        amt = r.get("amount_usd")
+        if isinstance(amt, int):
+            total += amt
+            if not largest or amt > (largest.get("amount_usd") or 0):
+                largest = {
+                    "round": r.get("round"),
+                    "date": r.get("date"),
+                    "amount_usd": amt,
+                    "lead": (", ".join(r.get("lead_investors") or []) or None),
+                }
+        leads_all.extend(r.get("lead_investors") or [])
+        leads_all.extend(r.get("other_investors") or [])
+    return {
+        "total_usd": total if total > 0 else None,
+        "largest": largest,
+        "lead_investors": _dedup_list(leads_all)[:6],
+    }
+
+def funding_glance_sentence(stats: dict) -> str:
+    if not stats or not any(stats.values()):
+        return "No public funding details found."
+    parts = []
+    total = stats.get("total_usd")
+    if total:
+        parts.append(f"Total {_abbr_usd(total)}")
+    largest = stats.get("largest") or {}
+    lr_round = largest.get("round")
+    lr_amt   = largest.get("amount_usd")
+    lr_date  = largest.get("date")
+    if lr_amt:
+        if lr_round and lr_date:
+            parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)} ({_fmt_date(lr_date)})")
+        elif lr_round:
+            parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)}")
+        else:
+            parts.append(f"Largest {_abbr_usd(lr_amt)}")
+    leads = stats.get("lead_investors") or []
+    if leads:
+        parts.append("Leads " + ", ".join(leads[:5]))
+    return " · ".join(parts) if parts else "No public funding details found."
+
+# ---------------- Result cleanup + rendering ----------------
+def tidy(results, prefer=(), limit=3):
+    seen=set(); cleaned=[]
+    for r in results or []:
+        url=r.get("url") or ""; title=(r.get("title") or "").lower()
+        if "search error" in title and not url: cleaned.append(r); continue
+        if not url or url in seen: continue
+        seen.add(url); cleaned.append(r)
+    if prefer: cleaned.sort(key=lambda x: any(p in (x.get("url") or "") for p in prefer), reverse=True)
+    return cleaned[:limit]
+
+def render_section(title, items, empty_hint):
+    st.subheader(title)
+    if not items: st.caption(empty_hint); return
+    for it in items:
+        ttl=it.get("title") or "(no title)"; url=it.get("url") or ""; snip=it.get("snippet") or ""
+        if url:
+            st.write(f"[{ttl}]({url}) - {snip}")
+        else:
+            st.write(f"{ttl} - {snip}")
+
+# ---------------- JSON schema for the guarded single call ----------------
 JSON_SCHEMA = {
     "name": "DDLite",
     "strict": True,
@@ -92,187 +227,22 @@ JSON_SCHEMA = {
     }
 }
 
-# -------------------------------------------------
-# Google Custom Search (cached)
-# -------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=86400)
-def serp(q, num=3):
-    cx = os.getenv("GOOGLE_CSE_ID")
-    key = os.getenv("GOOGLE_API_KEY")
-    if not cx or not key:
-        return []
-    num = min(num, 3)
-    resp = requests.get(
-        "https://www.googleapis.com/customsearch/v1",
-        params={"q": q, "cx": cx, "key": key, "num": num},
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        return [{
-            "title": f"Search error {resp.status_code}",
-            "snippet": resp.text[:200],
-            "url": "https://developers.google.com/custom-search/v1/overview"
-        }]
-    items = (resp.json().get("items") or [])[:num]
-    return [{"title": it.get("title",""), "snippet": it.get("snippet",""), "url": it.get("link","")} for it in items]
-
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
-def _domain(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-def _abbr_usd(n):
-    try:
-        n = int(n)
-    except Exception:
-        return ""
-    if n >= 1_000_000_000_000:
-        s = f"{n/1_000_000_000_000:.1f}T"
-    elif n >= 1_000_000_000:
-        s = f"{n/1_000_000_000:.1f}B"
-    elif n >= 1_000_000:
-        s = f"{n/1_000_000:.1f}M"
-    elif n >= 1_000:
-        s = f"{n/1_000:.0f}K"
-    else:
-        return f"${n:,}"
-    s = s.rstrip("0").rstrip(".")
-    return f"${s}"
-
-def _fmt_usd_full(n):
-    try:
-        return f"${int(n):,}"
-    except Exception:
-        return ""
-
-def _dedup_list(items):
-    seen = set(); out=[]
-    for x in items or []:
-        if x and x not in seen:
-            seen.add(x); out.append(x)
-    return out
-
-def _fmt_date(s: str | None) -> str:
-    if not s:
-        return ""
-    s = s.strip()
-    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%Y"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if fmt == "%Y":
-                return dt.strftime("%Y")
-            return dt.strftime("%b %d, %Y")
-        except Exception:
-            continue
-    return s
-
-# -------------------------------------------------
-# Funding helpers
-# -------------------------------------------------
-def _funding_stats(funding: dict) -> dict:
-    rounds = (funding or {}).get("rounds") or []
-    total = 0
-    largest = None
-    leads_all = []
-    for r in rounds:
-        amt = r.get("amount_usd")
-        if isinstance(amt, int):
-            total += amt
-            if not largest or amt > (largest.get("amount_usd") or 0):
-                largest = {
-                    "round": r.get("round"),
-                    "date": r.get("date"),
-                    "amount_usd": amt,
-                    "lead": (", ".join(r.get("lead_investors") or []) or None),
-                }
-        leads_all.extend(r.get("lead_investors") or [])
-        leads_all.extend(r.get("other_investors") or [])
-    return {
-        "total_usd": total if total > 0 else None,
-        "largest": largest,
-        "lead_investors": _dedup_list(leads_all)[:6],
-    }
-
-def funding_glance_sentence(stats: dict) -> str:
-    if not stats or not any(stats.values()):
-        return "No public funding details found."
-    parts = []
-    total = stats.get("total_usd")
-    if total:
-        parts.append(f"Total {_abbr_usd(total)}")
-    largest = stats.get("largest") or {}
-    lr_round = largest.get("round")
-    lr_amt   = largest.get("amount_usd")
-    lr_date  = largest.get("date")
-    if lr_amt:
-        if lr_round and lr_date:
-            parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)} ({_fmt_date(lr_date)})")
-        elif lr_round:
-            parts.append(f"Largest {lr_round} {_abbr_usd(lr_amt)}")
-        else:
-            parts.append(f"Largest {_abbr_usd(lr_amt)}")
-    leads = stats.get("lead_investors") or []
-    if leads:
-        parts.append("Leads " + ", ".join(leads[:5]))
-    return " · ".join(parts) if parts else "No public funding details found."
-
-# -------------------------------------------------
-# Result cleanup + rendering
-# -------------------------------------------------
-def tidy(results, prefer=(), limit=3):
-    seen, cleaned = set(), []
-    for r in results or []:
-        url = r.get("url") or ""
-        title = (r.get("title") or "").lower()
-        if "search error" in title and not url:
-            cleaned.append(r)
-            continue
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        cleaned.append(r)
-    if prefer:
-        cleaned.sort(key=lambda x: any(p in (x.get("url") or "") for p in prefer), reverse=True)
-    return cleaned[:limit]
-
-def render_section(title, items, empty_hint):
-    st.subheader(title)
-    if not items:
-        st.caption(empty_hint)
-        return
-    for it in items:
-        ttl = it.get("title") or "(no title)"
-        url = it.get("url") or ""
-        snip = it.get("snippet") or ""
-        if url:
-            st.write(f"[{ttl}]({url}) - {snip}")
-        else:
-            st.write(f"{ttl} - {snip}")
-
-# -------------------------------------------------
-# UI state
-# -------------------------------------------------
+# ---------------- UI state ----------------
 for key, default in [
-    ("company", ""),
-    ("gen_summary", True),
-    ("gen_founder_brief", True),
-    ("gen_market_map", True),
-    ("_busy", False),
+    ("company",""),
+    ("gen_summary",True),
+    ("gen_founder_brief",True),
+    ("gen_market_map",True),
+    ("_busy",False)
 ]:
     if key not in st.session_state:
-        st.session_state[key] = default
+        st.session_state[key]=default
 
-examples = ["", "Anthropic", "Plaid", "RunwayML", "Ramp", "Figma"]
-
+examples=["","Anthropic","Plaid","RunwayML","Ramp","Figma"]
 with st.form("search_form", clear_on_submit=False):
     company_input = st.text_input("Enter company name or website", value=st.session_state.company)
     example = st.selectbox("Or pick an example", examples, index=0)
-    if example:
-        company_input = example
+    if example: company_input = example
 
     gen_summary_input   = st.checkbox("Generate Investor Summary (OpenAI)", value=st.session_state.gen_summary)
     gen_founder_input   = st.checkbox("Generate Founder Brief (OpenAI)", value=st.session_state.gen_founder_brief)
@@ -297,44 +267,23 @@ if submitted and not name:
 if submitted and name:
     st.success(f"Profile for {name}")
 
-    # -------------------------------------------------
-    # Gather web signals
-    # -------------------------------------------------
+    # ------- Gather public signals -------
     with st.spinner("Gathering signals..."):
-        overview_results = tidy(
-            serp(f"{name} official site"),
-            prefer=("about", "wikipedia.org", "crunchbase.com", "linkedin.com")
-        )
-        team_results = tidy(
-            serp(f"{name} founders team leadership"),
-            prefer=("about", "team", "wikipedia.org", "linkedin.com", "crunchbase.com")
-        )
-        market_results = tidy(
-            serp(f"{name} target market TAM customers industry"),
-            prefer=("gartner.com", "forrester.com", "mckinsey.com", "bain.com")
-        )
-        competition_results = tidy(
-            serp(f"{name} competitors alternatives comparative"),
-            prefer=("g2.com", "capterra.com", "crunchbase.com", "wikipedia.org")
-        )
+        overview_results = tidy(serp(f"{name} official site"), prefer=("about","wikipedia.org","crunchbase.com","linkedin.com"))
+        team_results     = tidy(serp(f"{name} founders team leadership"), prefer=("about","team","wikipedia.org","linkedin.com","crunchbase.com"))
+        market_results   = tidy(serp(f"{name} target market TAM customers industry"), prefer=("gartner.com","forrester.com","mckinsey.com","bain.com"))
+        competition_results = tidy(serp(f"{name} competitors alternatives comparative"), prefer=("g2.com","capterra.com","crunchbase.com","wikipedia.org"))
 
     wiki = wiki_enrich(name)  # {"title","url","summary"} or None
 
-    # -------------------------------------------------
-    # Funding & Investors
-    # -------------------------------------------------
     funding = get_funding_data(name, serp_func=lambda q, num=3: serp(q, num))
     funding_stats = _funding_stats(funding)
 
-    # -------------------------------------------------
-    # Market Size (TAM) line (for investor summary)
-    # -------------------------------------------------
     market_size = get_market_size(name, serp_func=lambda q, num=3: serp(q, num))
 
     def _best_tam_line(ms: dict) -> str:
         ests = (ms or {}).get("estimates") or []
-        if not ests:
-            return "Market context: TAM not found from trusted public sources."
+        if not ests: return "Market context: TAM not found from trusted public sources."
         best = ests[0]
         amt = _abbr_usd(best.get("amount_usd"))
         year = best.get("year") or ""
@@ -344,31 +293,23 @@ if submitted and name:
         return f"Market context: TAM of {amt}{tail}."
     market_context_line = _best_tam_line(market_size)
 
-    # -------------------------------------------------
-    # Build grounding sources for the LLM
-    # -------------------------------------------------
-    sources_list = []
+    # ------- Build source list for LLM -------
+    sources_list=[]
     for coll in (overview_results, team_results, market_results, competition_results):
         for it in coll:
-            if it.get("url"):
-                sources_list.append(it["url"])
-    if wiki and wiki.get("url"):
-        sources_list.insert(0, wiki["url"])
-    for s in (funding.get("sources") or []):
-        if s:
-            sources_list.append(s)
+            if it.get("url"): sources_list.append(it["url"])
+    if wiki and wiki.get("url"): sources_list.insert(0, wiki["url"])
+    for s in (funding.get("sources") or []): 
+        if s: sources_list.append(s)
     for s in (market_size.get("sources") or []):
-        if s:
-            sources_list.append(s)
+        if s: sources_list.append(s)
     sources_list = _dedup_list(sources_list)[:12]
 
-    # -------------------------------------------------
-    # NEW: Auto Founder Potential (no manual input)
-    # -------------------------------------------------
+    # ------- Founder Potential (automatic; no manual inputs) -------
     st.divider()
     auto_founder_scoring_panel(
         company_name=name,
-        founder_hint=None,  # pass a string if you know a specific founder name
+        founder_hint=None,  # pass a specific founder name if you want to steer
         sources_list=sources_list,
         wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
         funding_stats=funding_stats,
@@ -377,9 +318,7 @@ if submitted and name:
     )
     st.divider()
 
-    # -------------------------------------------------
-    # Single guarded OpenAI call (only if any AI section is requested)
-    # -------------------------------------------------
+    # ------- Single guarded OpenAI call (only if any AI section is requested) -------
     data = None
     if gen_summary or gen_founder or gen_mmap:
         if not os.getenv("OPENAI_API_KEY"):
@@ -388,15 +327,12 @@ if submitted and name:
             st.session_state._busy = True
             try:
                 wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
-
-                # short TAM hints
                 ms_hints = []
                 for e in (market_size.get("estimates") or [])[:3]:
                     amt = e.get("amount_usd")
                     year = e.get("year") or "n/a"
                     scope = e.get("scope") or "Market size"
-                    if amt:
-                        ms_hints.append(f"- {scope}: {_abbr_usd(amt)} ({year})")
+                    if amt: ms_hints.append(f"- {scope}: {_abbr_usd(amt)} ({year})")
                 ms_hints_txt = "\n".join(ms_hints) if ms_hints else "- None found"
 
                 prompt = f"""
@@ -445,10 +381,10 @@ Return ONLY the JSON object; no markdown, no commentary.
                 data = None
             finally:
                 st.session_state._busy = False
+    else:
+        data = None
 
-    # -------------------------------------------------
-    # Tabs
-    # -------------------------------------------------
+    # ------- Tabs -------
     tabs = st.tabs([
         "Funding",
         "Investor Summary",
@@ -459,7 +395,7 @@ Return ONLY the JSON object; no markdown, no commentary.
         "JSON"
     ])
 
-    # -------- Funding tab --------
+    # Funding tab
     with tabs[0]:
         st.subheader("Funding & Investors")
         rounds = funding.get("rounds") or []
@@ -484,7 +420,7 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.markdown("**Notable investors**")
             st.write(", ".join(_dedup_list(investors[:10])))
 
-    # -------- Investor Summary tab --------
+    # Investor Summary tab
     with tabs[1]:
         st.subheader("Investor Summary")
         if data:
@@ -549,7 +485,7 @@ Return ONLY the JSON object; no markdown, no commentary.
         else:
             st.caption("LLM summary unavailable. See Signals tab for public sources.")
 
-    # -------- Founder Brief tab --------
+    # Founder Brief tab
     with tabs[2]:
         st.subheader("Founder Brief")
         if data:
@@ -602,7 +538,7 @@ Return ONLY the JSON object; no markdown, no commentary.
         else:
             st.caption("LLM founder brief unavailable. See Signals tab for public sources.")
 
-    # -------- Market Map tab --------
+    # Market Map tab
     with tabs[3]:
         st.subheader("Market Map")
         if data:
@@ -640,7 +576,7 @@ Return ONLY the JSON object; no markdown, no commentary.
         else:
             st.caption("LLM market map unavailable. See Signals tab for public sources.")
 
-    # -------- Market Size & Revenue tab --------
+    # Market Size & Revenue tab
     with tabs[4]:
         st.subheader("Market Size (TAM)")
         if data:
@@ -677,7 +613,7 @@ Return ONLY the JSON object; no markdown, no commentary.
         else:
             st.caption("LLM market size and revenue unavailable. See Signals tab for public sources.")
 
-    # -------- Signals tab (always visible) --------
+    # Signals tab (always visible)
     with tabs[5]:
         st.subheader("Public Signals")
         render_section("Company Overview", overview_results, "No overview found.")
@@ -709,7 +645,7 @@ _Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_
 """
         st.download_button("Download snapshot (Markdown)", md, file_name=f"{name}_snapshot.md", use_container_width=True)
 
-    # -------- JSON tab --------
+    # JSON tab
     with tabs[6]:
         st.subheader("Raw JSON")
         if data:
