@@ -1,237 +1,304 @@
 # app/founder_scoring.py
-# Low-Data Mode founder scoring with simplified UX, banded explanations,
-# and auto-generated analyst summary.
+# Auto (LLM-driven) Founder Potential scoring for Low-Data Mode.
+# - No manual inputs: pulls from the caller (company name, sources, wiki, funding, market size).
+# - Produces 7 trait scores (1–5), spike flags, coverage estimate, auto summary, and methodology.
+# - Renders a compact, analyst-friendly UI with chips for spikes and an explanation of bands.
 
 from __future__ import annotations
-import streamlit as st
-import pandas as pd
+import json
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+
+import streamlit as st
+
+# We call your guarded OpenAI wrapper
+from app.llm_guard import generate_once
 
 # ----------------------------- Config -----------------------------
 
-TRAITS: List[Tuple[str, str, str]] = [
-    ("DD",  "Domain Depth",                   "Has the founder shown expertise or meaningful experience in this domain?"),
-    ("UJ",  "Unconventional / Rigorous Journey", "Has the founder demonstrated grit via unconventional or rigorous paths?"),
-    ("HFT", "High-Fidelity Thinking",         "Does the founder articulate causal, testable reasoning (not vague vision)?"),
-    ("MMM", "Magnetism & Movement-Building",  "Can they attract talent/users/press and create pull around the mission?"),
-    ("VWC", "Velocity Without Capital",       "Any early traction or progress achieved with very little spend?"),
-    ("NC",  "Narrative Control",              "Do they frame the category and company clearly, credibly, and consistently?"),
-    ("TLI", "Technology Literacy + Imagination", "Do they understand the tech deeply and imagine non-obvious uses?"),
+TRAITS: List[Tuple[str, str]] = [
+    ("DD",  "Domain Depth"),
+    ("UJ",  "Unconventional / Rigorous Journey"),
+    ("HFT", "High-Fidelity Thinking"),
+    ("MMM", "Magnetism & Movement-Building"),
+    ("VWC", "Velocity Without Capital"),
+    ("NC",  "Narrative Control"),
+    ("TLI", "Technology Literacy + Imagination"),
 ]
 
+# Spike multiplier used in final score (transparent)
 SPIKE_MULTIPLIER = 1.5
+
+# Score banding (transparent, visible in UI)
 BANDS = {
-    "strong":   {"min": 26, "max": 35, "label": "Strong Signal",   "explain": "Likely **Bring to Partner**. Early traits align with USV Core pattern of pre-PMF winners."},
-    "moderate": {"min": 18, "max": 25, "label": "Moderate Signal", "explain": "Promising, but **needs more evidence** (customer proof, team magnets, or sharper causality)."},
-    "weak":     {"min":  0, "max": 17, "label": "Weak Signal",     "explain": "Probably **Pass for now**, unless there is one compelling wedge to investigate."},
+    "strong":   {"min": 26.0, "max": 35.0, "label": "Strong Signal",   "explain": "Likely **Bring to Partner**. Early traits align with USV Core pre-PMF winners."},
+    "moderate": {"min": 18.0, "max": 25.9, "label": "Moderate Signal", "explain": "Promising, but **needs more evidence** (customer proof, talent magnetism, or sharper causality)."},
+    "weak":     {"min":  0.0, "max": 17.9, "label": "Weak Signal",     "explain": "Probably **Pass for now**, unless there is one compelling wedge."},
 }
 
-EVIDENCE_LEVELS = {
-    "Low (<30%)": 20,
-    "Medium (30–60%)": 45,
-    "High (>60%)": 70,
-}
+# ------------------------- JSON schema ----------------------------
+
+def _auto_schema() -> dict:
+    """Strict schema the LLM must return for auto scoring."""
+    valid_keys = [k for k, _ in TRAITS]
+    valid_labels = [lbl for _, lbl in TRAITS]
+    return {
+        "name": "FounderAutoScore",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "founder_names": {"type": "array", "items": {"type": "string"}},
+                "coverage_pct": {"type": "integer", "minimum": 0, "maximum": 100},
+                "traits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "key":   {"type": "string", "enum": valid_keys},
+                            "label": {"type": "string", "enum": valid_labels},
+                            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                            "spike": {"type": "boolean"},
+                            "evidence": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1, "maxItems": 3
+                            }
+                        },
+                        "required": ["key", "label", "score", "spike", "evidence"]
+                    },
+                    "minItems": len(valid_keys), "maxItems": len(valid_keys)
+                },
+                "overall_summary": {"type": "string"},
+                "methodology": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 8},
+                "flags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["coverage_pct", "traits", "overall_summary", "methodology"]
+        }
+    }
+
+# ---------------------- Prompt builder ----------------------------
+
+def _auto_prompt(company: str,
+                 founder_hint: Optional[str],
+                 sources: List[str],
+                 wiki_summary: str,
+                 funding_stats: dict,
+                 market_size: dict) -> str:
+    # Known funding facts (to anchor the model, avoid hallucination)
+    total_usd = funding_stats.get("total_usd")
+    largest = funding_stats.get("largest") or {}
+    lr_round = largest.get("round") or "unknown"
+    lr_amt   = largest.get("amount_usd")
+    lr_date  = largest.get("date") or "unknown"
+    leads    = funding_stats.get("lead_investors") or []
+
+    # Market size quickline
+    ms_estimates = (market_size or {}).get("estimates") or []
+    if ms_estimates:
+        best = ms_estimates[0]
+        ms_hint = f"- Most relevant market size: ${best.get('amount_usd','?')} ({best.get('year','n/a')}) from {best.get('url','source')}."
+    else:
+        ms_hint = "- No credible market size found."
+
+    trait_help = """
+Traits to score (1–5):
+- DD (Domain Depth): evidence of deep domain expertise or relevant experience.
+- UJ (Unconventional/Rigorous Journey): grit via unusual or demanding paths.
+- HFT (High-Fidelity Thinking): clear causal reasoning, testable hypotheses.
+- MMM (Magnetism & Movement-Building): can attract talent/users/press.
+- VWC (Velocity Without Capital): progress/traction with very little spend.
+- NC (Narrative Control): frames category and company clearly and credibly.
+- TLI (Tech Literacy + Imagination): deep tech understanding and non-obvious uses.
+"""
+
+    return f"""
+You are scoring founders for a seed/Series A **Low-Data** workflow. Use ONLY the inputs below.
+Company: {company}
+Founder hint (may be empty): {founder_hint or "(none)"}
+
+Public sources to rely on (top 12 max):
+{json.dumps(sources, indent=2)}
+
+Optional background (Wikipedia):
+{(wiki_summary or "").strip()[:900]}
+
+Known funding facts (do not guess beyond these):
+- Total USD: {total_usd if total_usd else "unknown"}
+- Largest round: {lr_round}
+- Largest round amount: {lr_amt if lr_amt else "unknown"}
+- Largest round date: {lr_date}
+- Lead investors (if any): {", ".join(leads) if leads else "unknown"}
+
+Market context hints:
+{ms_hint}
+
+{trait_help}
+
+Rules:
+- Return the strict JSON schema provided (no extra keys). Each trait must include 1–3 short evidence bullets with sources in-line if possible (short host names).
+- Be conservative. If evidence is thin, lower the score and note the gap in evidence text.
+- Mark a trait "spike": true ONLY when there is clear, exceptional evidence vs typical seed/Series A founders.
+- coverage_pct = estimated % of ideal pre–Series A evidence you could find from the provided inputs (0–100).
+- methodology = 3–8 short bullets explaining how the rubric works in plain English (not company-specific).
+- overall_summary = 3–6 sentences, plain English, explaining the why behind the total signal.
+
+Return ONLY the JSON object.
+""".strip()
+
+# --------------------- Scoring utilities --------------------------
 
 @dataclass
-class ScoreResult:
+class ScorePack:
     weighted_total: float
     spike_bonus: float
-    max_base: int
+    max_base: float
     band_key: str
     band_label: str
     band_explain: str
-    percent_base: float
 
+def _band_for(total: float) -> Tuple[str, str, str]:
+    for k, meta in BANDS.items():
+        if meta["min"] <= total <= meta["max"]:
+            return k, meta["label"], meta["explain"]
+    return ("strong" if total > 35 else "weak",
+            BANDS["strong" if total > 35 else "weak"]["label"],
+            BANDS["strong" if total > 35 else "weak"]["explain"])
 
-# ---------------------- Scoring Helpers ---------------------------
-
-def _band_for(score: float) -> Tuple[str, str, str]:
-    """Return (band_key, label, explain) given a score out of 35."""
-    for key, meta in BANDS.items():
-        if meta["min"] <= score <= meta["max"]:
-            return key, meta["label"], meta["explain"]
-    # clamp
-    if score > 35: 
-        return "strong", BANDS["strong"]["label"], BANDS["strong"]["explain"]
-    return "weak", BANDS["weak"]["label"], BANDS["weak"]["explain"]
-
-def _compute_weighted(scores: Dict[str, int], spikes: Dict[str, bool]) -> ScoreResult:
-    max_base = len(TRAITS) * 5  # 35
-    weighted_total = 0.0
-    spike_bonus = 0.0
-    for key, _, _ in TRAITS:
-        s = int(scores.get(key, 1))
-        if spikes.get(key):
-            weighted_total += s * SPIKE_MULTIPLIER
-            spike_bonus += s * (SPIKE_MULTIPLIER - 1.0)
+def _score_from_traits(traits: List[dict]) -> ScorePack:
+    max_base = 5.0 * len(TRAITS)  # 35
+    raw = 0.0
+    bonus = 0.0
+    for t in traits:
+        s = float(t.get("score", 1))
+        if t.get("spike"):
+            raw += s * SPIKE_MULTIPLIER
+            bonus += s * (SPIKE_MULTIPLIER - 1.0)
         else:
-            weighted_total += s
-    # We still show score on a /35 scale for comparability
-    shown_total = min(round(weighted_total, 1), 35.0)
-    band_key, band_label, band_explain = _band_for(shown_total)
-    percent_base = round((shown_total / max_base) * 100.0, 1)
-    return ScoreResult(
-        weighted_total=shown_total,
-        spike_bonus=round(spike_bonus, 1),
-        max_base=max_base,
-        band_key=band_key,
-        band_label=band_label,
-        band_explain=band_explain,
-        percent_base=percent_base,
-    )
+            raw += s
+    shown = min(round(raw, 1), 35.0)
+    band_key, band_label, band_explain = _band_for(shown)
+    return ScorePack(shown, round(bonus, 1), max_base, band_key, band_label, band_explain)
 
-def _top_traits(scores: Dict[str, int], n=2) -> List[str]:
-    ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [k for k, _ in ordered[:n]]
+# --------------------- Render: Auto Panel -------------------------
 
-def _bottom_traits(scores: Dict[str, int], n=2) -> List[str]:
-    ordered = sorted(scores.items(), key=lambda kv: kv[1])
-    return [k for k, _ in ordered[:n]]
+def auto_founder_scoring_panel(
+    company_name: str,
+    founder_hint: Optional[str],
+    sources_list: List[str],
+    wiki_summary: str,
+    funding_stats: dict,
+    market_size: dict,
+    persist_path: Optional[str] = None,
+):
+    st.markdown("### Founder Potential — Auto (Low-Data Mode)")
+    st.caption("Scores are computed from public signals. No manual inputs required.")
 
-def _label_for(key: str) -> str:
-    for k, label, _ in TRAITS:
-        if k == key:
-            return label
-    return key
+    schema = _auto_schema()
+    prompt = _auto_prompt(company_name, founder_hint, sources_list, wiki_summary, funding_stats, market_size)
 
+    result = None
+    with st.spinner("Scoring founder potential from public signals…"):
+        try:
+            result = generate_once(prompt, schema)
+        except Exception as e:
+            st.error("Automatic scoring failed. You can still use the rest of the app.")
+            st.caption(str(e))
+            return
 
-# --------------------- Summary Generation -------------------------
+    # Defensive parsing
+    traits = result.get("traits") or []
+    coverage = int(result.get("coverage_pct") or 0)
+    founder_names = result.get("founder_names") or []
+    overall_summary = (result.get("overall_summary") or "").strip()
+    methodology = result.get("methodology") or []
+    flags = result.get("flags") or []
 
-def _auto_summary(founder: str, company: str, band_label: str, ev_level: str,
-                  scores: Dict[str, int], spikes: Dict[str, bool]) -> str:
-    strengths = _top_traits(scores, n=2)
-    gaps      = _bottom_traits(scores, n=2)
-    spike_list = [ _label_for(k) for k, v in spikes.items() if v ]
-    strengths_txt = ", ".join(_label_for(k) for k in strengths) if strengths else "—"
-    gaps_txt      = ", ".join(_label_for(k) for k in gaps) if gaps else "—"
-    spike_txt     = ", ".join(spike_list) if spike_list else "—"
+    # Score math & band
+    pack = _score_from_traits(traits)
 
-    # Light, partner-ready paragraph (edit-in-place by analyst)
-    return (
-        f"{founder or 'Founder'} ({company or 'Company'}) shows a **{band_label}** at a **{ev_level} evidence level**. "
-        f"Strengths appear in **{strengths_txt}**; biggest gaps are **{gaps_txt}**. "
-        f"Spiking traits: **{spike_txt}**. "
-        f"Recommendation: if pipeline fit is strong, proceed to validate gaps with 1–2 quick references or user signals."
-    )
+    # Header line: founders + spikes chips
+    founder_line = ", ".join(founder_names) if founder_names else "Founder(s): not detected"
+    st.markdown(f"**{founder_line}**")
 
+    spiking = [t for t in traits if t.get("spike")]
+    if spiking:
+        chips = " ".join([f"`{t.get('label','?')}`" for t in spiking])
+        st.caption(f"Spiking traits: {chips}")
+    else:
+        st.caption("Spiking traits: none detected")
 
-# ---------------------- Main UI Component -------------------------
-
-def founder_scoring_module(persist_path: Optional[str] = None):
-    st.markdown("### Founder Potential — Low-Data Mode")
-    st.caption(
-        "Score the founder on 7 traits USV cares about at Seed/Series A. "
-        "Use **Spike** for any trait that is unusually strong; this applies extra weight in low-data situations."
-    )
-
-    # Inputs
-    c1, c2, c3 = st.columns([2,2,1])
+    # Score cards
+    c1, c2, c3 = st.columns(3)
     with c1:
-        founder_name = st.text_input("Founder Name", placeholder="e.g., Anton Osika")
+        st.metric("Score (shown as /35)", f"{pack.weighted_total} / {int(pack.max_base)}")
     with c2:
-        company_name = st.text_input("Company Name", placeholder="e.g., Lovable")
+        st.metric("Coverage", f"{coverage}%")
     with c3:
-        ev_label = st.selectbox("Stage", ["Seed", "Series A", "Other"], index=0)
+        st.metric("Spike Bonus (raw)", f"+{pack.spike_bonus}")
 
-    # Evidence level (friendlier than a raw percentage slider)
-    ev_col1, ev_col2 = st.columns([2,1])
-    with ev_col1:
-        ev_level = st.selectbox("How much public evidence is available?",
-                                list(EVIDENCE_LEVELS.keys()), index=1,
-                                help="A quick gauge of how much pre-Series A signal you could find.")
-    with ev_col2:
-        coverage_pct = st.number_input("Coverage %", min_value=0, max_value=100,
-                                       value=EVIDENCE_LEVELS[ev_level],
-                                       help="You can override this if needed.")
+    # Band explanation (clear, always visible)
+    st.info(f"**{pack.band_label}** — {pack.band_explain}")
 
-    st.markdown("#### Score each trait (1–5). Tick **Spike** for standout performance.")
-    scores: Dict[str, int] = {}
-    spikes: Dict[str, bool] = {}
-    notes:  Dict[str, str]  = {}
-    # Inline grid — simpler than 7 expanders
-    for key, label, expl in TRAITS:
-        colL, colM, colR = st.columns([5,2,1])
-        with colL:
-            st.write(f"**{label}** – {expl}")
-            notes[key] = st.text_input(f"Evidence (links / short notes) — {label}", key=f"notes_{key}", placeholder="Optional evidence…")
-        with colM:
-            scores[key] = st.radio("Score", options=[1,2,3,4,5], horizontal=True, index=2, key=f"score_{key}",
-                                   label_visibility="collapsed")
-        with colR:
-            spikes[key] = st.checkbox("Spike", value=False, key=f"spike_{key}", help="Exceptional vs. peers? Check to weight more.")
+    # Evidence table (compact)
+    st.markdown("#### Evidence by Trait")
+    for t in traits:
+        st.markdown(f"**{t.get('label','?')}** — score {t.get('score','?')}" + (" · **Spike**" if t.get("spike") else ""))
+        for e in (t.get("evidence") or [])[:3]:
+            st.write(f"- {e}")
+        st.markdown("")
 
-        st.divider()
-
-    # Scoring
-    result = _compute_weighted(scores, spikes)
-
-    # Output — clear interpretation
-    st.markdown("### Founder Potential Score & Interpretation")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Score (shown as /35)", f"{result.weighted_total} / {result.max_base}")
-    with col2:
-        st.metric("Coverage", f"{coverage_pct}%")
-    with col3:
-        st.metric("Spike Bonus (raw)", f"+{result.spike_bonus}")
-
-    # Band explanation box
-    st.info(f"**{result.band_label}** — {result.band_explain}")
-
-    # Auto-generated Analyst Summary (editable)
+    # Auto summary (editable)
     st.markdown("#### Analyst Summary (auto-generated; edit if needed)")
-    default_summary = _auto_summary(
-        founder=founder_name, company=company_name, band_label=result.band_label,
-        ev_level=ev_level, scores=scores, spikes=spikes
-    )
-    summary = st.text_area("", value=default_summary, height=110)
+    summary_val = st.text_area("", value=overall_summary or "", height=120)
+
+    # Methodology (LLM) + hard-coded rubric details for transparency
+    with st.expander("How this grading works (methodology)"):
+        if methodology:
+            for m in methodology:
+                st.write(f"- {m}")
+            st.markdown("---")
+        st.write("**Rubric bands (transparent):**")
+        st.write("- **Strong Signal (26–35):** Bring to Partner likely.")
+        st.write("- **Moderate Signal (18–25.9):** Promising; needs more evidence.")
+        st.write("- **Weak Signal (<18):** Probably pass for now unless there’s a compelling wedge.")
+        st.write(f"**Spike weighting:** each spiking trait ×{SPIKE_MULTIPLIER}.")
+
+    if flags:
+        with st.expander("Auto-detected flags / caveats"):
+            for f in flags:
+                st.write(f"- {f}")
 
     # Optional persistence
-    saved_path = None
     if persist_path:
-        if st.button("Save to CSV"):
-            row = {
-                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "founder_name": founder_name,
-                "company_name": company_name,
-                "stage": ev_label,
-                "evidence_level": ev_level,
-                "coverage_pct": int(coverage_pct),
-                "score_weighted_total": float(result.weighted_total),
-                "percent_base": float(result.percent_base),
-                "band": result.band_key,
-                "band_label": result.band_label,
-                "spike_bonus": float(result.spike_bonus),
-                "spike_multiplier": SPIKE_MULTIPLIER,
-                "summary": summary,
-            }
-            for key, label, _ in TRAITS:
-                row[f"{key}_score"] = int(scores[key])
-                row[f"{key}_spike"] = bool(spikes[key])
-                row[f"{key}_notes"] = notes[key]
-
-            try:
-                df = pd.read_csv(persist_path)
-                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            except Exception:
-                df = pd.DataFrame([row])
-            df.to_csv(persist_path, index=False)
-            saved_path = persist_path
-            st.success(f"Saved to {persist_path}")
-
-    # Return for callers
-    return {
-        "founder": founder_name,
-        "company": company_name,
-        "stage": ev_label,
-        "coverage_pct": int(coverage_pct),
-        "scores": scores,
-        "spikes": spikes,
-        "summary": summary,
-        "weighted_total": float(result.weighted_total),
-        "percent_base": float(result.percent_base),
-        "evaluation": f"{result.band_label} — {BANDS[result.band_key]['explain']}",
-        "saved_path": saved_path,
-    }
+        try:
+            import pandas as pd
+            if st.button("Save auto-score to CSV"):
+                row = {
+                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "company_name": company_name,
+                    "founder_names": ", ".join(founder_names),
+                    "coverage_pct": coverage,
+                    "score_weighted_total": pack.weighted_total,
+                    "band": pack.band_key,
+                    "band_label": pack.band_label,
+                    "spike_bonus": pack.spike_bonus,
+                    "summary": summary_val,
+                }
+                for t in traits:
+                    k = t.get("key")
+                    row[f"{k}_score"] = int(t.get("score", 0))
+                    row[f"{k}_spike"] = bool(t.get("spike", False))
+                import pandas as pd
+                try:
+                    df = pd.read_csv(persist_path)
+                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                except Exception:
+                    df = pd.DataFrame([row])
+                df.to_csv(persist_path, index=False)
+                st.success(f"Saved to {persist_path}")
+        except Exception as e:
+            st.warning(f"CSV save unavailable: {e}")
