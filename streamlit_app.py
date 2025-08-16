@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.12.0 — Accordion UX + centered layout + robust founder detection + DDG fallback
-# Keeps original pipeline: funding_lookup, wiki_enrich, market_size, JSON LLM brief
+# v0.12.3 — Accordion UX + centered layout + robust founder detection + DDG fallback
+# Restores full modules and correctly renders Founder Brief & Market Map from the LLM JSON.
 
 import os
 import re
@@ -37,13 +37,15 @@ st.markdown(
     <style>
       .block-container { max-width: 980px; margin: auto; }
       .stCaption { opacity: .75 }
+      /* tighter expander body */
+      div.streamlit-expanderContent { padding-top: .5rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.12.0 — Accordion UX • centered • founder detection + evidence • public search fallback")
+st.caption("Build: v0.12.3 — Founder Brief & Market Map now render from generated JSON")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -205,8 +207,8 @@ NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 BLACKLIST_TOKENS = {
     "Inc","LLC","Ltd","Series","Founder","CEO","Co",
     "Cofounder","Co-founder","Founder/CEO","University","College",
-    "Institute","Lab","Labs","School","Center","Research","Holdings",
-    "Capital","Ventures","Official","Profile","View","Press"
+    "Institute","Lab","Labs","School","Center","Research","Foundation",
+    "Holdings","Capital","Ventures","Official","Profile","View","Press"
 }
 
 LOCATION_BLACKLIST = {
@@ -223,18 +225,14 @@ def _extract_names(text: str) -> list[str]:
         candidate = m.strip()
         parts = candidate.split()
 
-        # Filter non-alpha tokens and too-short tokens
+        # Drop tokens that are short/non-alpha (e.g., HTML bits)
         if any(len(p) < 2 or not p.isalpha() for p in parts):
             continue
 
-        # Filter institutions / generic tokens
         if any(p in BLACKLIST_TOKENS for p in parts):
             continue
-
-        # Filter locations or known non-person phrases
         if candidate in LOCATION_BLACKLIST:
             continue
-
         if len(parts) > 3:
             continue
 
@@ -243,9 +241,9 @@ def _extract_names(text: str) -> list[str]:
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def detect_founders_with_evidence(company: str):
-    """Return (top_names, evidence_dict[name] -> {score, sources})"""
+    """Return (top_names, evidence_dict[name] -> {score, sources}, all_urls)"""
     if not company:
-        return [], {}
+        return [], {}, []
 
     queries = [
         f"{company} founder",
@@ -262,6 +260,7 @@ def detect_founders_with_evidence(company: str):
     from collections import Counter, defaultdict
     scores = Counter()
     evidence = defaultdict(lambda: {"score": 0, "sources": set()})
+    all_urls = []
 
     for q in queries:
         for item in serp(q, num=3):
@@ -269,9 +268,11 @@ def detect_founders_with_evidence(company: str):
             sn  = item.get("snippet","") or ""
             url = item.get("url","") or ""
             dom = _domain(url)
-            text = f"{ttl}. {sn}"
+            if url: all_urls.append(url)
 
+            text = f"{ttl}. {sn}"
             names = _extract_names(text)
+
             boost = 3 if "founder" in q.lower() else 1
             if "linkedin.com/in" in url: boost += 2
             if "wikipedia.org"   in url: boost += 2
@@ -280,13 +281,12 @@ def detect_founders_with_evidence(company: str):
             for n in names:
                 scores[n] += boost
                 evidence[n]["score"] += boost
-                if dom:
-                    evidence[n]["sources"].add(dom)
+                if dom: evidence[n]["sources"].add(dom)
 
     ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
     top = [nm for nm, _ in ranked][:3]
     ev = {nm: {"score": evidence[nm]["score"], "sources": sorted(list(evidence[nm]["sources"]))[:3]} for nm in top}
-    return top, ev
+    return top, ev, _dedup_list(all_urls)[:10]
 
 # ===============================================================
 # JSON schema for the guarded OpenAI brief (unchanged)
@@ -364,6 +364,7 @@ for key, default in [
     ("gen_founder_brief", True),
     ("gen_market_map", True),
     ("_busy", False),
+    ("llm_data", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -385,6 +386,7 @@ if submitted:
     st.session_state.gen_summary = gen_summary_input
     st.session_state.gen_founder_brief = gen_founder_input
     st.session_state.gen_market_map = gen_marketmap_input
+    st.session_state.llm_data = None  # reset last run
 
 name = st.session_state.company
 if submitted and not name:
@@ -429,7 +431,7 @@ if submitted and name:
     sources_list = _dedup_list(sources_list)[:12]
 
     # --- Founder detection (robust) + evidence + manual override
-    detected, evidence = detect_founders_with_evidence(name)
+    detected, evidence, founder_urls = detect_founders_with_evidence(name)
     founder_hint = ", ".join(detected) if detected else ""
     founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
     if evidence:
@@ -440,10 +442,11 @@ if submitted and name:
     # --- Founder Potential (automatic)
     st.markdown("## Founder Potential")
     if auto_founder_scoring_panel:
+        sources_for_scoring = _dedup_list(sources_list + founder_urls)[:15]
         auto_founder_scoring_panel(
             company_name=name,
             founder_hint=(founder_hint or None),
-            sources_list=sources_list,
+            sources_list=sources_for_scoring,
             wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
             funding_stats=funding_stats,
             market_size=market_size,
@@ -453,47 +456,24 @@ if submitted and name:
         st.error(f"Founder scoring module not found: {_fp_import_err}")
 
     # -------------------------------
-    # Accordion sections (full stack)
+    # Investor Summary (generates JSON ONCE and saves it)
     # -------------------------------
-    with st.expander("Funding & Investors", expanded=True):
-        rounds = funding.get("rounds") or []
-        investors = funding.get("investors") or []
-        st.subheader("Funding & Investors")
-        if rounds:
-            table_rows = []
-            for r in rounds[:10]:
-                table_rows.append({
-                    "Round": r.get("round") or "",
-                    "Date": _fmt_date(r.get("date")),
-                    "Amount": _abbr_usd(r.get("amount_usd")) if r.get("amount_usd") else "",
-                    "Lead": ", ".join(_dedup_list(r.get("lead_investors") or [])),
-                })
-            st.table(table_rows)
-            st.text(f"Funding at a glance: {funding_glance_sentence(funding_stats)}")
-            st.caption("Note: Public-source parse; amounts reflect reported round sizes (not valuations).")
-        else:
-            st.caption("No funding data found yet (public sources).")
-        if investors:
-            st.markdown("**Notable investors**")
-            st.write(", ".join(_dedup_list(investors[:12])))
-
-    with st.expander("Investor Summary", expanded=False):
-        data = None
-        gen_any = st.session_state.gen_summary or st.session_state.gen_founder_brief or st.session_state.gen_market_map
-        if gen_any:
+    with st.expander("Investor Summary", expanded=True):
+        data = st.session_state.llm_data
+        if st.session_state.gen_summary or st.session_state.gen_founder_brief or st.session_state.gen_market_map:
             if not os.getenv("OPENAI_API_KEY"):
                 st.info("Set OPENAI_API_KEY in Streamlit Secrets to enable AI sections.")
             else:
-                st.session_state._busy = True
-                try:
-                    wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
-                    ms_hints = []
-                    for e in (market_size.get("estimates") or [])[:3]:
-                        amt = e.get("amount_usd"); year = e.get("year") or "n/a"; scope = e.get("scope") or "Market size"
-                        if amt: ms_hints.append(f"- {scope}: {_abbr_usd(amt)} ({year})")
-                    ms_hints_txt = "\n".join(ms_hints) if ms_hints else "- None found"
+                if data is None:
+                    try:
+                        wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
+                        ms_hints = []
+                        for e in (market_size.get("estimates") or [])[:3]:
+                            amt = e.get("amount_usd"); year = e.get("year") or "n/a"; scope = e.get("scope") or "Market size"
+                            if amt: ms_hints.append(f"- {scope}: {_abbr_usd(amt)} ({year})")
+                        ms_hints_txt = "\n".join(ms_hints) if ms_hints else "- None found"
 
-                    prompt = f"""
+                        prompt = f"""
 Return ONE JSON object that matches the provided schema.
 Company: {name}
 Website: null
@@ -530,19 +510,17 @@ Instructions:
 - For sources: include up to 10 URLs with a short note; notes can be empty strings.
 Return ONLY the JSON object; no markdown, no commentary.
 """.strip()
-
-                    data = generate_once(prompt, JSON_SCHEMA)
-                except Exception as e:
-                    st.error("There was a problem generating the brief. Showing public signals instead.")
-                    data = None
-                finally:
-                    st.session_state._busy = False
+                        with st.spinner("Generating structured brief..."):
+                            data = generate_once(prompt, JSON_SCHEMA)
+                        st.session_state.llm_data = data  # SAVE for other sections
+                    except Exception:
+                        st.error("There was a problem generating the brief. Showing public signals instead.")
+                        data = None
 
         if data:
             inv = (data.get("investor_summary") or "").strip()
             src = data.get("sources") or []
 
-            # bulletize and patch bullet #2 with verified funding stats
             lines = [ln.strip() for ln in inv.replace("\r", "").split("\n") if ln.strip()] if inv else []
             bullets = []
             for b in (lines or []):
@@ -550,7 +528,7 @@ Return ONLY the JSON object; no markdown, no commentary.
                 if not b.endswith((".", "?", "!")): b += "."
                 bullets.append(b)
 
-            # ensure funding bullet is consistent
+            # ensure funding bullet is consistent with parsed stats
             try:
                 total = funding_stats.get("total_usd")
                 largest = funding_stats.get("largest") or {}
@@ -588,15 +566,113 @@ Return ONLY the JSON object; no markdown, no commentary.
         else:
             st.caption("LLM summary unavailable. See Signals section for public sources.")
 
+    # -------------------------------
+    # Founder Brief — renders from saved JSON
+    # -------------------------------
     with st.expander("Founder Brief", expanded=False):
-        st.caption("See Investor Summary → Founder Brief output when generated.")
+        data = st.session_state.llm_data
+        if not data or not isinstance(data, dict):
+            st.info("No founder brief generated yet. Enable 'Generate Investor Summary' and run again.")
+        else:
+            fb = data.get("founder_brief") or {}
+            founders = [x for x in (fb.get("founders") or []) if x]
+            highlights = [x for x in (fb.get("highlights") or []) if x]
+            open_qs = [x for x in (fb.get("open_questions") or []) if x]
 
+            if founders:
+                st.markdown("**Founders**")
+                for f in founders:
+                    st.write(f"- {f}")
+            if highlights:
+                st.markdown("**Highlights**")
+                for h in highlights[:8]:
+                    st.write(f"- {h}")
+            if open_qs:
+                st.markdown("**Open Questions**")
+                for q in open_qs[:6]:
+                    st.write(f"- {q}")
+            if not any([founders, highlights, open_qs]):
+                st.caption("No structured founder details in the current JSON output.")
+
+    # -------------------------------
+    # Market Map — renders from saved JSON
+    # -------------------------------
     with st.expander("Market Map", expanded=False):
-        st.caption("See Investor Summary → Market Map output when generated.")
+        data = st.session_state.llm_data
+        if not data or not isinstance(data, dict):
+            st.info("No market map generated yet. Enable 'Generate Investor Summary' and run again.")
+        else:
+            mm = data.get("market_map") or {}
+            axes = [x for x in (mm.get("axes") or []) if x]
+            competitors = [x for x in (mm.get("competitors") or []) if x]
+            diffs = [x for x in (mm.get("differentiators") or []) if x]
 
+            if axes:
+                st.markdown("**Positioning Axes**")
+                st.write(", ".join(axes))
+            if competitors:
+                st.markdown("**Competitors**")
+                for c in competitors[:10]:
+                    st.write(f"- {c}")
+            if diffs:
+                st.markdown("**Differentiators**")
+                for d in diffs[:8]:
+                    st.write(f"- {d}")
+            if not any([axes, competitors, diffs]):
+                st.caption("No structured market map in the current JSON output.")
+
+    # -------------------------------
+    # Market Size & Revenue — prefer JSON if present; fall back to TAM line
+    # -------------------------------
     with st.expander("Market Size & Revenue", expanded=False):
-        st.write(market_context_line)
+        data = st.session_state.llm_data
+        if data and isinstance(data, dict):
+            st.subheader("Market Size (from JSON)")
+            st.write((data.get("market_size") or "").strip() or "Not found from public sources.")
+            st.subheader("Estimated Revenue")
+            st.write((data.get("estimated_revenue") or "").strip() or "Not found")
+            mon = data.get("monetization") or {}
+            if mon:
+                bm = mon.get("business_model") or ""
+                rvs = mon.get("revenue_streams") or []
+                if bm:
+                    st.markdown("**Business model**"); st.write(bm)
+                if rvs:
+                    st.markdown("**Revenue streams**")
+                    for item in rvs[:8]:
+                        st.write(f"- {item}")
+        else:
+            st.subheader("Market Size (from public sources)")
+            st.write(market_context_line)
 
+    # -------------------------------
+    # Funding & Investors (unchanged)
+    # -------------------------------
+    with st.expander("Funding & Investors", expanded=False):
+        rounds = funding.get("rounds") or []
+        investors = funding.get("investors") or []
+        st.subheader("Funding & Investors")
+        if rounds:
+            table_rows = []
+            for r in rounds[:10]:
+                table_rows.append({
+                    "Round": r.get("round") or "",
+                    "Date": _fmt_date(r.get("date")),
+                    "Amount": _abbr_usd(r.get("amount_usd")) if r.get("amount_usd") else "",
+                    "Lead": ", ".join(_dedup_list(r.get("lead_investors") or [])),
+                })
+            st.table(table_rows)
+            st.text(f"Funding at a glance: {funding_glance_sentence(funding_stats)}")
+            st.caption("Note: Public-source parse; amounts reflect reported round sizes (not valuations).")
+        else:
+            st.caption("No funding data found yet (public sources).")
+        if investors:
+            st.markdown("**Notable investors**")
+            st.write(", ".join(_dedup_list(investors[:12])))
+
+    # -------------------------------
+    # Signals (public sources)
+    # -------------------------------
     with st.expander("Signals (public sources)", expanded=False):
         def _render(title, items, empty_hint):
             st.subheader(title)
