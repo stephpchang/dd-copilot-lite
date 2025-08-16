@@ -9,16 +9,15 @@ import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
 
-# --- Founder Potential module (root-level file: founder_scoring.py) ---
-# If you keep founder_scoring.py elsewhere, adjust the import accordingly.
+# --- Founder Potential module (lives in app/founder_scoring.py) ---
 try:
     # --- import founder scoring module from app/ ---
-import os, sys
-APP_ROOT = os.path.dirname(__file__)
-if APP_ROOT not in sys.path:
-    sys.path.append(APP_ROOT)
+    import os, sys
+    APP_ROOT = os.path.dirname(__file__)
+    if APP_ROOT not in sys.path:
+        sys.path.append(APP_ROOT)
 
-from app.founder_scoring import founder_scoring_module
+    from app.founder_scoring import founder_scoring_module
 except Exception as e:
     founder_scoring_module = None
     _fp_import_err = str(e)
