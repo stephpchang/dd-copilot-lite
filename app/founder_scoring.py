@@ -1,8 +1,6 @@
 # app/founder_scoring.py
-# Auto (LLM-driven) Founder Potential scoring for Low-Data Mode.
-# - No manual inputs: pulls from the caller (company name, sources, wiki, funding, market size).
-# - Produces 7 trait scores (1–5), spike flags, coverage estimate, auto summary, and methodology.
-# - Renders a compact, analyst-friendly UI with chips for spikes and an explanation of bands.
+# Automatic (no-input) founder scoring: computes 7 trait scores, spikes, coverage,
+# banded result, evidence bullets, and an auto summary. Works with llm_guard.generate_once.
 
 from __future__ import annotations
 import json
@@ -11,13 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import streamlit as st
-
-# We call your guarded OpenAI wrapper
-from app.llm_guard import generate_once
+from app.llm_guard import generate_once  # guarded OpenAI wrapper
 
 # ----------------------------- Config -----------------------------
 
-TRAITS: List[Tuple[str, str]] = [
+TRAITS = [
     ("DD",  "Domain Depth"),
     ("UJ",  "Unconventional / Rigorous Journey"),
     ("HFT", "High-Fidelity Thinking"),
@@ -27,58 +23,50 @@ TRAITS: List[Tuple[str, str]] = [
     ("TLI", "Technology Literacy + Imagination"),
 ]
 
-# Spike multiplier used in final score (transparent)
 SPIKE_MULTIPLIER = 1.5
-
-# Score banding (transparent, visible in UI)
 BANDS = {
     "strong":   {"min": 26.0, "max": 35.0, "label": "Strong Signal",   "explain": "Likely **Bring to Partner**. Early traits align with USV Core pre-PMF winners."},
     "moderate": {"min": 18.0, "max": 25.9, "label": "Moderate Signal", "explain": "Promising, but **needs more evidence** (customer proof, talent magnetism, or sharper causality)."},
-    "weak":     {"min":  0.0, "max": 17.9, "label": "Weak Signal",     "explain": "Probably **Pass for now**, unless there is one compelling wedge."},
+    "weak":     {"min":  0.0, "max": 17.9, "label": "Weak Signal",     "explain": "Probably **Pass for now**, unless there is a compelling wedge."},
 }
 
 # ------------------------- JSON schema ----------------------------
 
 def _auto_schema() -> dict:
-    """Strict schema the LLM must return for auto scoring."""
-    valid_keys = [k for k, _ in TRAITS]
+    """Strict schema compatible with llm_guard: required must include ALL properties."""
+    valid_keys   = [k for k, _ in TRAITS]
     valid_labels = [lbl for _, lbl in TRAITS]
-    return {
-        "name": "FounderAutoScore",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "founder_names": {"type": "array", "items": {"type": "string"}},
-                "coverage_pct": {"type": "integer", "minimum": 0, "maximum": 100},
-                "traits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "key":   {"type": "string", "enum": valid_keys},
-                            "label": {"type": "string", "enum": valid_labels},
-                            "score": {"type": "integer", "minimum": 1, "maximum": 5},
-                            "spike": {"type": "boolean"},
-                            "evidence": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "minItems": 1, "maxItems": 3
-                            }
-                        },
-                        "required": ["key", "label", "score", "spike", "evidence"]
-                    },
-                    "minItems": len(valid_keys), "maxItems": len(valid_keys)
+    properties = {
+        "founder_names": {"type": "array", "items": {"type": "string"}},
+        "coverage_pct":  {"type": "integer", "minimum": 0, "maximum": 100},
+        "traits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "key":   {"type": "string", "enum": valid_keys},
+                    "label": {"type": "string", "enum": valid_labels},
+                    "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "spike": {"type": "boolean"},
+                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3}
                 },
-                "overall_summary": {"type": "string"},
-                "methodology": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 8},
-                "flags": {"type": "array", "items": {"type": "string"}}
+                "required": ["key", "label", "score", "spike", "evidence"]
             },
-            "required": ["coverage_pct", "traits", "overall_summary", "methodology"]
-        }
+            "minItems": len(valid_keys), "maxItems": len(valid_keys)
+        },
+        "overall_summary": {"type": "string"},
+        "methodology":     {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 8},
+        "flags":           {"type": "array", "items": {"type": "string"}}
     }
+    # llm_guard requires ALL properties listed under "required"
+    required = list(properties.keys())
+    return {"name": "FounderAutoScore", "strict": True, "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required
+    }}
 
 # ---------------------- Prompt builder ----------------------------
 
@@ -88,15 +76,13 @@ def _auto_prompt(company: str,
                  wiki_summary: str,
                  funding_stats: dict,
                  market_size: dict) -> str:
-    # Known funding facts (to anchor the model, avoid hallucination)
     total_usd = funding_stats.get("total_usd")
-    largest = funding_stats.get("largest") or {}
-    lr_round = largest.get("round") or "unknown"
-    lr_amt   = largest.get("amount_usd")
-    lr_date  = largest.get("date") or "unknown"
-    leads    = funding_stats.get("lead_investors") or []
+    largest   = funding_stats.get("largest") or {}
+    lr_round  = largest.get("round") or "unknown"
+    lr_amt    = largest.get("amount_usd")
+    lr_date   = largest.get("date") or "unknown"
+    leads     = funding_stats.get("lead_investors") or []
 
-    # Market size quickline
     ms_estimates = (market_size or {}).get("estimates") or []
     if ms_estimates:
         best = ms_estimates[0]
@@ -105,25 +91,25 @@ def _auto_prompt(company: str,
         ms_hint = "- No credible market size found."
 
     trait_help = """
-Traits to score (1–5):
-- DD (Domain Depth): evidence of deep domain expertise or relevant experience.
-- UJ (Unconventional/Rigorous Journey): grit via unusual or demanding paths.
-- HFT (High-Fidelity Thinking): clear causal reasoning, testable hypotheses.
-- MMM (Magnetism & Movement-Building): can attract talent/users/press.
-- VWC (Velocity Without Capital): progress/traction with very little spend.
-- NC (Narrative Control): frames category and company clearly and credibly.
-- TLI (Tech Literacy + Imagination): deep tech understanding and non-obvious uses.
+Score these traits 1–5 (5 is best):
+- DD: domain expertise or relevant experience.
+- UJ: grit via unconventional/rigorous paths.
+- HFT: clear causal reasoning and testable hypotheses.
+- MMM: attracts talent/users/press; movement-building.
+- VWC: progress with very little spend.
+- NC: frames and owns the narrative credibly.
+- TLI: deep technical literacy and imaginative use.
 """
 
     return f"""
-You are scoring founders for a seed/Series A **Low-Data** workflow. Use ONLY the inputs below.
+You are scoring founders for a seed/Series A Low-Data workflow. Use ONLY the inputs below.
 Company: {company}
 Founder hint (may be empty): {founder_hint or "(none)"}
 
 Public sources to rely on (top 12 max):
 {json.dumps(sources, indent=2)}
 
-Optional background (Wikipedia):
+Optional background (Wikipedia snippet):
 {(wiki_summary or "").strip()[:900]}
 
 Known funding facts (do not guess beyond these):
@@ -131,7 +117,7 @@ Known funding facts (do not guess beyond these):
 - Largest round: {lr_round}
 - Largest round amount: {lr_amt if lr_amt else "unknown"}
 - Largest round date: {lr_date}
-- Lead investors (if any): {", ".join(leads) if leads else "unknown"}
+- Lead investors: {", ".join(leads) if leads else "unknown"}
 
 Market context hints:
 {ms_hint}
@@ -139,12 +125,13 @@ Market context hints:
 {trait_help}
 
 Rules:
-- Return the strict JSON schema provided (no extra keys). Each trait must include 1–3 short evidence bullets with sources in-line if possible (short host names).
-- Be conservative. If evidence is thin, lower the score and note the gap in evidence text.
-- Mark a trait "spike": true ONLY when there is clear, exceptional evidence vs typical seed/Series A founders.
-- coverage_pct = estimated % of ideal pre–Series A evidence you could find from the provided inputs (0–100).
-- methodology = 3–8 short bullets explaining how the rubric works in plain English (not company-specific).
-- overall_summary = 3–6 sentences, plain English, explaining the why behind the total signal.
+- Return the strict JSON schema provided (no extra keys).
+- Each trait must include 1–3 short evidence bullets; include short host names where possible.
+- Be conservative: if evidence is thin, lower the score and say so in evidence bullets.
+- Mark "spike": true ONLY when evidence is clearly exceptional for seed/Series A.
+- coverage_pct = estimated % of ideal pre–Series A evidence found from provided inputs (0–100).
+- methodology = 3–8 short bullets explaining the rubric in plain English.
+- overall_summary = 3–6 sentences explaining why the score/band was assigned.
 
 Return ONLY the JSON object.
 """.strip()
@@ -153,8 +140,8 @@ Return ONLY the JSON object.
 
 @dataclass
 class ScorePack:
-    weighted_total: float
-    spike_bonus: float
+    total: float
+    bonus: float
     max_base: float
     band_key: str
     band_label: str
@@ -194,56 +181,50 @@ def auto_founder_scoring_panel(
     market_size: dict,
     persist_path: Optional[str] = None,
 ):
-    st.markdown("### Founder Potential — Auto (Low-Data Mode)")
+    st.markdown("### Founder Potential")  # (removed 'Auto (Low-Data Mode)')
     st.caption("Scores are computed from public signals. No manual inputs required.")
 
     schema = _auto_schema()
     prompt = _auto_prompt(company_name, founder_hint, sources_list, wiki_summary, funding_stats, market_size)
 
-    result = None
-    with st.spinner("Scoring founder potential from public signals…"):
-        try:
+    try:
+        with st.spinner("Scoring founder potential from public signals…"):
             result = generate_once(prompt, schema)
-        except Exception as e:
-            st.error("Automatic scoring failed. You can still use the rest of the app.")
-            st.caption(str(e))
-            return
+    except Exception as e:
+        st.error("Automatic scoring failed. You can still use the rest of the app.")
+        st.caption(str(e))
+        return
 
     # Defensive parsing
-    traits = result.get("traits") or []
-    coverage = int(result.get("coverage_pct") or 0)
+    traits        = result.get("traits") or []
+    coverage      = int(result.get("coverage_pct") or 0)
     founder_names = result.get("founder_names") or []
-    overall_summary = (result.get("overall_summary") or "").strip()
-    methodology = result.get("methodology") or []
-    flags = result.get("flags") or []
+    overall_sum   = (result.get("overall_summary") or "").strip()
+    methodology   = result.get("methodology") or []
+    flags         = result.get("flags") or []
 
-    # Score math & band
     pack = _score_from_traits(traits)
 
-    # Header line: founders + spikes chips
-    founder_line = ", ".join(founder_names) if founder_names else "Founder(s): not detected"
-    st.markdown(f"**{founder_line}**")
+    # Header: founders + spikes (chips)
+    headline = ", ".join(founder_names) if founder_names else "Founder(s): not detected"
+    st.markdown(f"**{headline}**")
 
     spiking = [t for t in traits if t.get("spike")]
-    if spiking:
-        chips = " ".join([f"`{t.get('label','?')}`" for t in spiking])
-        st.caption(f"Spiking traits: {chips}")
-    else:
-        st.caption("Spiking traits: none detected")
+    st.caption("Spiking traits: " + (" ".join(f"`{t.get('label','?')}`" for t in spiking) if spiking else "none detected"))
 
     # Score cards
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Score (shown as /35)", f"{pack.weighted_total} / {int(pack.max_base)}")
+        st.metric("Score (shown as /35)", f"{pack.total} / 35")
     with c2:
         st.metric("Coverage", f"{coverage}%")
     with c3:
-        st.metric("Spike Bonus (raw)", f"+{pack.spike_bonus}")
+        st.metric("Spike Bonus (raw)", f"+{pack.bonus}")
 
-    # Band explanation (clear, always visible)
+    # Band explanation (always visible)
     st.info(f"**{pack.band_label}** — {pack.band_explain}")
 
-    # Evidence table (compact)
+    # Evidence by trait
     st.markdown("#### Evidence by Trait")
     for t in traits:
         st.markdown(f"**{t.get('label','?')}** — score {t.get('score','?')}" + (" · **Spike**" if t.get("spike") else ""))
@@ -253,9 +234,9 @@ def auto_founder_scoring_panel(
 
     # Auto summary (editable)
     st.markdown("#### Analyst Summary (auto-generated; edit if needed)")
-    summary_val = st.text_area("", value=overall_summary or "", height=120)
+    st.text_area("", value=overall_sum, height=120)
 
-    # Methodology (LLM) + hard-coded rubric details for transparency
+    # Methodology + transparent rules
     with st.expander("How this grading works (methodology)"):
         if methodology:
             for m in methodology:
@@ -271,34 +252,3 @@ def auto_founder_scoring_panel(
         with st.expander("Auto-detected flags / caveats"):
             for f in flags:
                 st.write(f"- {f}")
-
-    # Optional persistence
-    if persist_path:
-        try:
-            import pandas as pd
-            if st.button("Save auto-score to CSV"):
-                row = {
-                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    "company_name": company_name,
-                    "founder_names": ", ".join(founder_names),
-                    "coverage_pct": coverage,
-                    "score_weighted_total": pack.weighted_total,
-                    "band": pack.band_key,
-                    "band_label": pack.band_label,
-                    "spike_bonus": pack.spike_bonus,
-                    "summary": summary_val,
-                }
-                for t in traits:
-                    k = t.get("key")
-                    row[f"{k}_score"] = int(t.get("score", 0))
-                    row[f"{k}_spike"] = bool(t.get("spike", False))
-                import pandas as pd
-                try:
-                    df = pd.read_csv(persist_path)
-                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-                except Exception:
-                    df = pd.DataFrame([row])
-                df.to_csv(persist_path, index=False)
-                st.success(f"Saved to {persist_path}")
-        except Exception as e:
-            st.warning(f"CSV save unavailable: {e}")
