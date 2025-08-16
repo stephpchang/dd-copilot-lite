@@ -1,26 +1,12 @@
 # streamlit_app.py
-# Due Diligence Co-Pilot (Lite) + Founder Potential (Low-Data Mode) up front
+# Due Diligence Co-Pilot (Lite) + Auto Founder Potential panel (no manual inputs)
 
 import os
-import sys
 import json
 import requests
 import streamlit as st
 from urllib.parse import urlparse
 from datetime import datetime
-
-# --- Founder Potential module (lives in app/founder_scoring.py) ---
-try:
-    # --- import founder scoring module from app/ ---
-    import os, sys
-    APP_ROOT = os.path.dirname(__file__)
-    if APP_ROOT not in sys.path:
-        sys.path.append(APP_ROOT)
-
-    from app.founder_scoring import founder_scoring_module
-except Exception as e:
-    founder_scoring_module = None
-    _fp_import_err = str(e)
 
 # Existing app modules
 from app.llm_guard import generate_once
@@ -28,45 +14,19 @@ from app.public_provider import wiki_enrich
 from app.funding_lookup import get_funding_data
 from app.market_size import get_market_size
 
+# NEW: auto founder scoring panel (no manual inputs)
+from app.founder_scoring import auto_founder_scoring_panel
+
 # -------------------------------------------------
 # App config
 # -------------------------------------------------
 st.set_page_config(page_title="Due Diligence Co-Pilot (Lite)", layout="centered")
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.9.3 — Founder Potential module added up front; tabs unchanged")
+st.caption("Build: v0.10.0 — Auto Founder Potential panel (no manual scoring)")
 
 # -------------------------------------------------
-# Founder Potential — Low-Data Mode (front and center)
-# -------------------------------------------------
-st.subheader("Founder Potential — Low-Data Mode (Score First)")
-if founder_scoring_module is None:
-    st.warning(
-        "Founder scoring module not found. "
-        "Place **founder_scoring.py** at the repo root (same folder as this file). "
-        f"Import error: {_fp_import_err if '_fp_import_err' in globals() else 'unknown'}"
-    )
-    result = {}
-else:
-    # Toggle CSV persistence via env var; keep OFF on Streamlit Cloud initially.
-    PERSIST = os.environ.get("FOUNDER_PERSIST", "false").lower() == "true"
-    persist_path = os.path.join("data", "founder_scores.csv") if PERSIST else None
-    # Render the scoring UI
-    result = founder_scoring_module(persist_path=persist_path)
-
-    # Lightweight guidance banner based on evaluation
-    ev = (result or {}).get("evaluation", "")
-    if ev.startswith(("Outstanding", "Strong")):
-        st.success("Flagged for partner review based on Founder Potential Score.")
-    elif ev.startswith("Moderate"):
-        st.info("Moderate signal — gather more evidence or run quick ref checks.")
-    elif ev.startswith("Low"):
-        st.warning("Low signal — proceed only if there’s another compelling wedge.")
-
-st.divider()
-
-# -------------------------------------------------
-# JSON schema for the guarded single call (unchanged)
+# JSON schema for the guarded single call
 # -------------------------------------------------
 JSON_SCHEMA = {
     "name": "DDLite",
@@ -75,7 +35,7 @@ JSON_SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "investor_summary": {"type": "string"},  # newline-bulleted text
+            "investor_summary": {"type": "string"},
             "founder_brief": {
                 "type": "object",
                 "additionalProperties": False,
@@ -135,7 +95,7 @@ JSON_SCHEMA = {
 # -------------------------------------------------
 # Google Custom Search (cached)
 # -------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=86400)  # 24h to preserve quota
+@st.cache_data(show_spinner=False, ttl=86400)
 def serp(q, num=3):
     cx = os.getenv("GOOGLE_CSE_ID")
     key = os.getenv("GOOGLE_API_KEY")
@@ -157,7 +117,7 @@ def serp(q, num=3):
     return [{"title": it.get("title",""), "snippet": it.get("snippet",""), "url": it.get("link","")} for it in items]
 
 # -------------------------------------------------
-# Helpers: formatting & utilities
+# Helpers
 # -------------------------------------------------
 def _domain(url: str) -> str:
     try:
@@ -367,7 +327,7 @@ if submitted and name:
     funding_stats = _funding_stats(funding)
 
     # -------------------------------------------------
-    # Market Size (TAM) for hints + deterministic market context line
+    # Market Size (TAM) line (for investor summary)
     # -------------------------------------------------
     market_size = get_market_size(name, serp_func=lambda q, num=3: serp(q, num))
 
@@ -401,6 +361,21 @@ if submitted and name:
         if s:
             sources_list.append(s)
     sources_list = _dedup_list(sources_list)[:12]
+
+    # -------------------------------------------------
+    # NEW: Auto Founder Potential (no manual input)
+    # -------------------------------------------------
+    st.divider()
+    auto_founder_scoring_panel(
+        company_name=name,
+        founder_hint=None,  # pass a string if you know a specific founder name
+        sources_list=sources_list,
+        wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
+        funding_stats=funding_stats,
+        market_size=market_size,
+        persist_path=None   # or "app/data/founder_scores.csv" if you want CSV
+    )
+    st.divider()
 
     # -------------------------------------------------
     # Single guarded OpenAI call (only if any AI section is requested)
@@ -550,17 +525,15 @@ Return ONLY the JSON object; no markdown, no commentary.
             except Exception:
                 pass
 
-            market_context_line = "Market context: TAM not found from trusted public sources."
-            try:
-                # reuse prior calc if exists
-                pass
-            except Exception:
-                pass
+            if market_context_line:
+                if len(bullets) >= 4:
+                    bullets[3] = market_context_line
+                else:
+                    bullets.append(market_context_line)
 
             for b in bullets[:7]:
                 st.write(f"- {b}")
 
-            # Sources inline
             def render_sources(sources, limit=8):
                 links = []
                 for s in (sources or [])[:limit]:
@@ -671,7 +644,7 @@ Return ONLY the JSON object; no markdown, no commentary.
     with tabs[4]:
         st.subheader("Market Size (TAM)")
         if data:
-            ms  = data.get("market_size") or ""
+            ms  = (data.get("market_size") or "").strip()
             rev = (data.get("estimated_revenue") or "").strip()
             mon = (data.get("monetization") or {}) or {}
             src = data.get("sources") or []
