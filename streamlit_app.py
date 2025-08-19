@@ -1,7 +1,6 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.12.3 — Accordion UX + centered layout + robust founder detection + DDG fallback
-# Restores full modules and correctly renders Founder Brief & Market Map from the LLM JSON.
+# v0.12.4 — Founder Potential: clearer copy + legend + collapse raw panel; Founder Brief: context + skim-first chips
 
 import os
 import re
@@ -45,7 +44,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.12.3 — Founder Brief & Market Map now render from generated JSON")
+st.caption("Build: v0.12.4 — clearer Founder Potential + context-first Founder Brief")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -225,10 +224,8 @@ def _extract_names(text: str) -> list[str]:
         candidate = m.strip()
         parts = candidate.split()
 
-        # Drop tokens that are short/non-alpha (e.g., HTML bits)
         if any(len(p) < 2 or not p.isalpha() for p in parts):
             continue
-
         if any(p in BLACKLIST_TOKENS for p in parts):
             continue
         if candidate in LOCATION_BLACKLIST:
@@ -439,21 +436,56 @@ if submitted and name:
         rows = [{"Name": nm, "Score": evidence[nm]["score"], "Sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
         st.table(rows)
 
-    # --- Founder Potential (automatic)
-    st.markdown("## Founder Potential")
-    if auto_founder_scoring_panel:
-        sources_for_scoring = _dedup_list(sources_list + founder_urls)[:15]
-        auto_founder_scoring_panel(
-            company_name=name,
-            founder_hint=(founder_hint or None),
-            sources_list=sources_for_scoring,
-            wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
-            funding_stats=funding_stats,
-            market_size=market_size,
-            persist_path=None,
-        )
+    # --- Founder Potential (automatic) — clarified UX
+    st.markdown("## Founder Potential (first-pass signals)")
+    st.caption(
+        "Quick, automated read from public sources — use this to **triage**, not decide. "
+        "Add a founder’s LinkedIn or About page above and re-run for better coverage."
+    )
+
+    # Context chips
+    summary_bits = []
+    if detected:
+        summary_bits.append(f"Founders: {', '.join(detected)}")
     else:
-        st.error(f"Founder scoring module not found: {_fp_import_err}")
+        summary_bits.append("Founders not confidently identified")
+    if funding_stats.get("total_usd"):
+        summary_bits.append(f"Public funding: {_abbr_usd(funding_stats['total_usd'])}")
+    if wiki and wiki.get("summary"):
+        summary_bits.append("Wikipedia summary found")
+
+    chips = " ".join(
+        f"<span style='background:#f1f5f9;border:1px solid #e2e8f0;border-radius:999px;"
+        f"padding:2px 8px;font-size:12px;color:#334155'>{html.escape(bit)}</span>"
+        for bit in summary_bits
+    )
+    st.markdown(chips, unsafe_allow_html=True)
+
+    # Legend / labels
+    with st.expander("How this score works", expanded=False):
+        st.markdown(
+            "- **Score (out of 35):** 7 founder signals × up to 5 points each.\n"
+            "- **Signal coverage:** how many of the 7 signals we could verify from public sources.\n"
+            "- **Standout bonus (up to +5):** extra points for high-signal traits visible in public info "
+            "(e.g., repeat founder, strong technical background, fast product cadence).\n"
+            "- This is **directional**. Use it to shape questions; final judgment is human."
+        )
+
+    # Raw scoring UI (original panel) behind details
+    with st.expander("Detailed scoring (show)", expanded=False):
+        if auto_founder_scoring_panel:
+            sources_for_scoring = _dedup_list(sources_list + founder_urls)[:15]
+            auto_founder_scoring_panel(
+                company_name=name,
+                founder_hint=(founder_hint or None),
+                sources_list=sources_for_scoring,
+                wiki_summary=(wiki.get("summary") if wiki and wiki.get("summary") else ""),
+                funding_stats=funding_stats,
+                market_size=market_size,
+                persist_path=None,
+            )
+        else:
+            st.error(f"Founder scoring module not found: {_fp_import_err}")
 
     # -------------------------------
     # Investor Summary (generates JSON ONCE and saves it)
@@ -567,7 +599,7 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.caption("LLM summary unavailable. See Signals section for public sources.")
 
     # -------------------------------
-    # Founder Brief — renders from saved JSON
+    # Founder Brief — context-first skim view
     # -------------------------------
     with st.expander("Founder Brief", expanded=False):
         data = st.session_state.llm_data
@@ -575,24 +607,81 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.info("No founder brief generated yet. Enable 'Generate Investor Summary' and run again.")
         else:
             fb = data.get("founder_brief") or {}
-            founders = [x for x in (fb.get("founders") or []) if x]
-            highlights = [x for x in (fb.get("highlights") or []) if x]
-            open_qs = [x for x in (fb.get("open_questions") or []) if x]
+            founders_raw = [x for x in (fb.get("founders") or []) if x]
+            highlights   = [x for x in (fb.get("highlights") or []) if x]
+            open_qs      = [x for x in (fb.get("open_questions") or []) if x]
 
-            if founders:
-                st.markdown("**Founders**")
-                for f in founders:
-                    st.write(f"- {f}")
-            if highlights:
-                st.markdown("**Highlights**")
-                for h in highlights[:8]:
-                    st.write(f"- {h}")
-            if open_qs:
-                st.markdown("**Open Questions**")
-                for q in open_qs[:6]:
-                    st.write(f"- {q}")
-            if not any([founders, highlights, open_qs]):
-                st.caption("No structured founder details in the current JSON output.")
+            # Parse founder lines into (name, role, blurb)
+            founders = []
+            for line in founders_raw:
+                parts = re.split(r"\s+[-—]\s+", str(line), 1)
+                name  = parts[0].strip()
+                blurb = parts[1].strip() if len(parts) > 1 else ""
+                role_match = re.search(
+                    r"\b(CEO|CTO|COO|CFO|Chief [A-Za-z]+|[Cc]o-?founder|Founder|Head of [A-Za-z ]+)\b",
+                    blurb
+                )
+                role = role_match.group(0) if role_match else "Founder"
+                founders.append((name, role, blurb))
+
+            # ---------- Context first ----------
+            st.markdown("**How to read this**")
+            st.caption(
+                "This section supports first-pass founder assessment using a seven-signal rubric "
+                "(domain insight, execution, hiring pull, communication, customer focus, learning speed, integrity). "
+                "Start with the quick takeaways below, then scan the bios."
+            )
+
+            # Compact skim view
+            compact = st.checkbox("Compact view", value=True, help="Show only at-a-glance + top takeaways.")
+
+            cols = st.columns(2)
+            with cols[0]:
+                st.markdown("**Founders (at a glance)**")
+                if founders:
+                    chips = " ".join([
+                        f"<span style='background:#eef2ff;border:1px solid #c7d2fe;"
+                        f"border-radius:999px;padding:2px 8px;font-size:12px;color:#3730a3'>"
+                        f"{html.escape(n)} · {html.escape(r)}</span>"
+                        for (n, r, _) in founders[:6]
+                    ])
+                    st.markdown(chips, unsafe_allow_html=True)
+                else:
+                    st.caption("No founders parsed from the brief.")
+
+            with cols[1]:
+                st.markdown("**Read this first**")
+                read_first = []
+                read_first.extend(highlights[:2])
+                if open_qs:
+                    read_first.append(open_qs[0])
+                if read_first:
+                    for p in read_first:
+                        st.write(f"- {p}")
+                else:
+                    st.caption("No highlights or open questions found in the brief.")
+
+            if not compact:
+                st.divider()
+                # Full bios
+                if founders:
+                    st.markdown("**Founder bios**")
+                    for name, role, blurb in founders:
+                        if blurb:
+                            st.write(f"- **{name}** ({role}) — {blurb}")
+                        else:
+                            st.write(f"- **{name}** ({role})")
+                # Additional details
+                if highlights:
+                    st.markdown("**Additional highlights**")
+                    for h in highlights[:8]:
+                        st.write(f"- {h}")
+                if open_qs:
+                    st.markdown("**Open questions**")
+                    for q in open_qs[:6]:
+                        st.write(f"- {q}")
+                if not any([founders, highlights, open_qs]):
+                    st.caption("No structured founder details in the current JSON output.")
 
     # -------------------------------
     # Market Map — renders from saved JSON
