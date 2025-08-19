@@ -1,254 +1,217 @@
 # app/founder_scoring.py
-# Automatic (no-input) founder scoring: computes 7 trait scores, spikes, coverage,
-# banded result, evidence bullets, and an auto summary. Works with llm_guard.generate_once.
+# Founder Potential panel (clarified labels)
+# Computes a coarse, first-pass score from public signals passed in by the app.
+# Score = Base (out of 35; 7 signals × 5) + Bonus (0–5) for standout traits.
+# This is a directional triage aid — not a decision.
 
 from __future__ import annotations
-import json
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
-from datetime import datetime
 
+import re
+import html
 import streamlit as st
-from app.llm_guard import generate_once  # guarded OpenAI wrapper
+from urllib.parse import urlparse
+from typing import List, Dict, Any
 
-# ----------------------------- Config -----------------------------
-
-TRAITS = [
-    ("DD",  "Domain Depth"),
-    ("UJ",  "Unconventional / Rigorous Journey"),
-    ("HFT", "High-Fidelity Thinking"),
-    ("MMM", "Magnetism & Movement-Building"),
-    ("VWC", "Velocity Without Capital"),
-    ("NC",  "Narrative Control"),
-    ("TLI", "Technology Literacy + Imagination"),
+SEVEN_SIGNALS = [
+    "Domain insight",
+    "Execution",
+    "Hiring pull",
+    "Communication",
+    "Customer focus",
+    "Learning speed",
+    "Integrity",
 ]
 
-SPIKE_MULTIPLIER = 1.5
-BANDS = {
-    "strong":   {"min": 26.0, "max": 35.0, "label": "Strong Signal",   "explain": "Likely **Bring to Partner**. Early traits align with USV Core pre-PMF winners."},
-    "moderate": {"min": 18.0, "max": 25.9, "label": "Moderate Signal", "explain": "Promising, but **needs more evidence** (customer proof, talent magnetism, or sharper causality)."},
-    "weak":     {"min":  0.0, "max": 17.9, "label": "Weak Signal",     "explain": "Probably **Pass for now**, unless there is a compelling wedge."},
-}
+def _domain(u: str) -> str:
+    try:
+        return urlparse(u).netloc.lower()
+    except Exception:
+        return ""
 
-# ------------------------- JSON schema ----------------------------
+def _has_any(s: str, needles: List[str]) -> bool:
+    s = (s or "").lower()
+    return any(n.lower() in s for n in needles)
 
-def _auto_schema() -> dict:
-    """Strict schema compatible with llm_guard: required must include ALL properties."""
-    valid_keys   = [k for k, _ in TRAITS]
-    valid_labels = [lbl for _, lbl in TRAITS]
-    properties = {
-        "founder_names": {"type": "array", "items": {"type": "string"}},
-        "coverage_pct":  {"type": "integer", "minimum": 0, "maximum": 100},
-        "traits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "key":   {"type": "string", "enum": valid_keys},
-                    "label": {"type": "string", "enum": valid_labels},
-                    "score": {"type": "integer", "minimum": 1, "maximum": 5},
-                    "spike": {"type": "boolean"},
-                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3}
-                },
-                "required": ["key", "label", "score", "spike", "evidence"]
-            },
-            "minItems": len(valid_keys), "maxItems": len(valid_keys)
-        },
-        "overall_summary": {"type": "string"},
-        "methodology":     {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 8},
-        "flags":           {"type": "array", "items": {"type": "string"}}
-    }
-    # llm_guard requires ALL properties listed under "required"
-    required = list(properties.keys())
-    return {"name": "FounderAutoScore", "strict": True, "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": properties,
-        "required": required
-    }}
+def _score_signal(
+    name: str,
+    wiki_summary: str,
+    founder_hint: str | None,
+    sources_list: List[str],
+    funding_stats: Dict[str, Any],
+) -> tuple[int, List[str]]:
+    """Return (score_0_to_5, evidence_lines) using light-touch heuristics."""
+    ev = []
+    score = 0
+    domains = [_domain(u) for u in (sources_list or [])]
 
-# ---------------------- Prompt builder ----------------------------
+    # Domain insight
+    if name == "Domain insight":
+        if len(wiki_summary or "") > 300:
+            score += 3; ev.append("Substantive background (Wikipedia summary present).")
+        if any(d for d in domains if d.endswith(("substack.com","medium.com","github.com","readthedocs.io"))):
+            score += 1; ev.append("Public writing/docs signal.")
+        if funding_stats.get("total_usd"):
+            score += 1; ev.append("External validation via funding.")
+        score = min(score, 5)
 
-def _auto_prompt(company: str,
-                 founder_hint: Optional[str],
-                 sources: List[str],
-                 wiki_summary: str,
-                 funding_stats: dict,
-                 market_size: dict) -> str:
-    total_usd = funding_stats.get("total_usd")
-    largest   = funding_stats.get("largest") or {}
-    lr_round  = largest.get("round") or "unknown"
-    lr_amt    = largest.get("amount_usd")
-    lr_date   = largest.get("date") or "unknown"
-    leads     = funding_stats.get("lead_investors") or []
+    # Execution
+    elif name == "Execution":
+        if any(d for d in domains if "github.com" in d or "docs." in d or "changelog" in d):
+            score += 2; ev.append("Code/docs/changelog present.")
+        if any("release" in u.lower() for u in (sources_list or [])):
+            score += 1; ev.append("Release notes in sources.")
+        if funding_stats.get("largest", {}).get("date"):
+            score += 1; ev.append("Recent round suggests delivery momentum.")
+        if any(d for d in domains if "producthunt.com" in d or "notion.site" in d):
+            score += 1; ev.append("Public launches/roadmaps.")
+        score = min(score, 5)
 
-    ms_estimates = (market_size or {}).get("estimates") or []
-    if ms_estimates:
-        best = ms_estimates[0]
-        ms_hint = f"- Most relevant market size: ${best.get('amount_usd','?')} ({best.get('year','n/a')}) from {best.get('url','source')}."
-    else:
-        ms_hint = "- No credible market size found."
+    # Hiring pull
+    elif name == "Hiring pull":
+        if any("linkedin.com/in" in u for u in (sources_list or [])):
+            score += 2; ev.append("Founder LinkedIn signals team magnetism.")
+        if any(d for d in domains if "jobs" in d or "greenhouse.io" in d or "lever.co" in d):
+            score += 1; ev.append("Active hiring page.")
+        if (funding_stats.get("total_usd") or 0) >= 5_000_000:
+            score += 1; ev.append("Capital to hire.")
+        if founder_hint and ("," in founder_hint or " & " in founder_hint):
+            score += 1; ev.append("Multiple founders indicated.")
+        score = min(score, 5)
 
-    trait_help = """
-Score these traits 1–5 (5 is best):
-- DD: domain expertise or relevant experience.
-- UJ: grit via unconventional/rigorous paths.
-- HFT: clear causal reasoning and testable hypotheses.
-- MMM: attracts talent/users/press; movement-building.
-- VWC: progress with very little spend.
-- NC: frames and owns the narrative credibly.
-- TLI: deep technical literacy and imaginative use.
-"""
+    # Communication
+    elif name == "Communication":
+        if any(d for d in domains if d.endswith(("substack.com","medium.com","mirror.xyz"))):
+            score += 2; ev.append("Public writing channel.")
+        if any(d for d in domains if "twitter.com" in d or "x.com" in d):
+            score += 1; ev.append("Public comms/social present.")
+        if _has_any(wiki_summary, ["spoke", "talk", "conference", "keynote"]):
+            score += 1; ev.append("Speaking/history in public record.")
+        if any(d for d in domains if "press" in d or "techcrunch.com" in d):
+            score += 1; ev.append("Press references.")
+        score = min(score, 5)
 
-    return f"""
-You are scoring founders for a seed/Series A Low-Data workflow. Use ONLY the inputs below.
-Company: {company}
-Founder hint (may be empty): {founder_hint or "(none)"}
+    # Customer focus
+    elif name == "Customer focus":
+        if any(d for d in domains if "g2.com" in d or "capterra.com" in d or "case" in d):
+            score += 2; ev.append("Customer reviews/case studies.")
+        if any("customers" in u.lower() or "case-study" in u.lower() for u in (sources_list or [])):
+            score += 1; ev.append("Customer content in sources.")
+        if _has_any(wiki_summary, ["customer", "users", "clients"]):
+            score += 1; ev.append("Customer orientation mentioned.")
+        if any(d for d in domains if "docs." in d):
+            score += 1; ev.append("Docs imply user empathy.")
+        score = min(score, 5)
 
-Public sources to rely on (top 12 max):
-{json.dumps(sources, indent=2)}
+    # Learning speed
+    elif name == "Learning speed":
+        if any("changelog" in u.lower() or "release notes" in u.lower() for u in (sources_list or [])):
+            score += 2; ev.append("Frequent updates implied.")
+        if any(d for d in domains if "github.com" in d):
+            score += 1; ev.append("Github present.")
+        if _has_any(wiki_summary, ["iterate", "experiments", "rapid"]):
+            score += 1; ev.append("Iteration signals in bio/summary.")
+        if any(d for d in domains if "notion.site" in d or "trello" in d):
+            score += 1; ev.append("Roadmap/iteration artifacts.")
+        score = min(score, 5)
 
-Optional background (Wikipedia snippet):
-{(wiki_summary or "").strip()[:900]}
+    # Integrity (very conservative / proxy-based)
+    elif name == "Integrity":
+        if any(d for d in domains if "wikipedia.org" in d or "crunchbase.com" in d or "linkedin.com" in d):
+            score += 2; ev.append("Verified public profiles.")
+        if _has_any(wiki_summary, ["nonprofit","ethics","open source","license"]):
+            score += 1; ev.append("Values/work transparency noted.")
+        # No negative-signal scraping; keep this as a light positive prior
+        score = min(max(score, 1), 5)  # ensure non-zero baseline if any evidence gathered
 
-Known funding facts (do not guess beyond these):
-- Total USD: {total_usd if total_usd else "unknown"}
-- Largest round: {lr_round}
-- Largest round amount: {lr_amt if lr_amt else "unknown"}
-- Largest round date: {lr_date}
-- Lead investors: {", ".join(leads) if leads else "unknown"}
+    return score, ev
 
-Market context hints:
-{ms_hint}
+def _bonus_and_traits(wiki_summary: str, founder_hint: str | None, sources_list: List[str]) -> tuple[int, List[str]]:
+    """Return (bonus_0_to_5, traits_list)."""
+    traits = []
+    bonus = 0
+    text = (wiki_summary or "") + " " + (founder_hint or "")
+    text_l = text.lower()
+    domains = [_domain(u) for u in (sources_list or [])]
 
-{trait_help}
+    # Repeat founder / prior exits
+    if any(k in text_l for k in ["repeat founder","serial founder","previously founded","acquired","exit","sold company"]):
+        traits.append("Repeat founder / prior exit")
+        bonus += 2
 
-Rules:
-- Return the strict JSON schema provided (no extra keys).
-- Each trait must include 1–3 short evidence bullets; include short host names where possible.
-- Be conservative: if evidence is thin, lower the score and say so in evidence bullets.
-- Mark "spike": true ONLY when evidence is clearly exceptional for seed/Series A.
-- coverage_pct = estimated % of ideal pre–Series A evidence found from provided inputs (0–100).
-- methodology = 3–8 short bullets explaining the rubric in plain English.
-- overall_summary = 3–6 sentences explaining why the score/band was assigned.
+    # Strong technical background
+    if any(k in text_l for k in ["phd","researcher","professor","ml engineer","systems engineer","cto","compiler","cryptography","distributed systems"]):
+        traits.append("Strong technical background")
+        bonus += 2
 
-Return ONLY the JSON object.
-""".strip()
+    # Fast product cadence / open-source activity
+    if any("github.com" in d for d in domains) or any(k in " ".join(sources_list).lower() for k in ["changelog","release notes"]):
+        traits.append("Visible product cadence")
+        bonus += 1
 
-# --------------------- Scoring utilities --------------------------
-
-@dataclass
-class ScorePack:
-    total: float
-    bonus: float
-    max_base: float
-    band_key: str
-    band_label: str
-    band_explain: str
-
-def _band_for(total: float) -> Tuple[str, str, str]:
-    for k, meta in BANDS.items():
-        if meta["min"] <= total <= meta["max"]:
-            return k, meta["label"], meta["explain"]
-    return ("strong" if total > 35 else "weak",
-            BANDS["strong" if total > 35 else "weak"]["label"],
-            BANDS["strong" if total > 35 else "weak"]["explain"])
-
-def _score_from_traits(traits: List[dict]) -> ScorePack:
-    max_base = 5.0 * len(TRAITS)  # 35
-    raw = 0.0
-    bonus = 0.0
-    for t in traits:
-        s = float(t.get("score", 1))
-        if t.get("spike"):
-            raw += s * SPIKE_MULTIPLIER
-            bonus += s * (SPIKE_MULTIPLIER - 1.0)
-        else:
-            raw += s
-    shown = min(round(raw, 1), 35.0)
-    band_key, band_label, band_explain = _band_for(shown)
-    return ScorePack(shown, round(bonus, 1), max_base, band_key, band_label, band_explain)
-
-# --------------------- Render: Auto Panel -------------------------
+    # Cap at 5
+    bonus = min(bonus, 5)
+    return bonus, traits
 
 def auto_founder_scoring_panel(
     company_name: str,
-    founder_hint: Optional[str],
+    founder_hint: str | None,
     sources_list: List[str],
     wiki_summary: str,
-    funding_stats: dict,
-    market_size: dict,
-    persist_path: Optional[str] = None,
+    funding_stats: Dict[str, Any],
+    market_size: Dict[str, Any] | None = None,
+    persist_path: str | None = None,
 ):
-    st.markdown("### Founder Potential")  # (removed 'Auto (Low-Data Mode)')
-    st.caption("Scores are computed from public signals. No manual inputs required.")
+    """Render the Founder Potential panel with clarified labels and breakdown."""
+    st.markdown("### Detailed scoring")
+    st.caption("Directional, first-pass signals compiled from public sources.")
 
-    schema = _auto_schema()
-    prompt = _auto_prompt(company_name, founder_hint, sources_list, wiki_summary, funding_stats, market_size)
+    # Per-signal scoring
+    per_signal = {}
+    coverage_hits = 0
+    base_total = 0
+    for sig in SEVEN_SIGNALS:
+        sc, ev = _score_signal(sig, wiki_summary, founder_hint, sources_list, funding_stats)
+        per_signal[sig] = {"score": sc, "evidence": ev}
+        if ev:
+            coverage_hits += 1
+        base_total += sc
 
-    try:
-        with st.spinner("Scoring founder potential from public signals…"):
-            result = generate_once(prompt, schema)
-    except Exception as e:
-        st.error("Automatic scoring failed. You can still use the rest of the app.")
-        st.caption(str(e))
-        return
+    coverage_pct = int(round((coverage_hits / len(SEVEN_SIGNALS)) * 100)) if SEVEN_SIGNALS else 0
+    bonus, traits = _bonus_and_traits(wiki_summary, founder_hint, sources_list)
+    final_score = min(base_total + bonus, 40)
 
-    # Defensive parsing
-    traits        = result.get("traits") or []
-    coverage      = int(result.get("coverage_pct") or 0)
-    founder_names = result.get("founder_names") or []
-    overall_sum   = (result.get("overall_summary") or "").strip()
-    methodology   = result.get("methodology") or []
-    flags         = result.get("flags") or []
+    # Headline metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Score (out of 40)", f"{final_score:.1f}")
+    c2.metric("Base (out of 35)", f"{base_total:.1f}")
+    c3.metric("Signal coverage", f"{coverage_pct}%")
+    c4.metric("Bonus (0–5)", f"+{bonus:.1f}")
 
-    pack = _score_from_traits(traits)
+    # Standout traits
+    if traits:
+        chips = " ".join(
+            f"<span style='background:#ecfdf5;border:1px solid #a7f3d0;border-radius:999px;"
+            f"padding:2px 8px;font-size:12px;color:#065f46'>{html.escape(t)}</span>"
+            for t in traits
+        )
+        st.markdown(f"**Standout traits (public):** {chips}", unsafe_allow_html=True)
+    else:
+        st.caption("Standout traits (public): none detected")
 
-    # Header: founders + spikes (chips)
-    headline = ", ".join(founder_names) if founder_names else "Founder(s): not detected"
-    st.markdown(f"**{headline}**")
+    # Breakdown
+    with st.expander("Per-signal breakdown", expanded=False):
+        for sig in SEVEN_SIGNALS:
+            row = per_signal[sig]
+            st.write(f"- **{sig}:** {row['score']} / 5")
+            for ev in row["evidence"]:
+                st.write(f"   • {ev}")
 
-    spiking = [t for t in traits if t.get("spike")]
-    st.caption("Spiking traits: " + (" ".join(f"`{t.get('label','?')}`" for t in spiking) if spiking else "none detected"))
-
-    # Score cards
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Score (shown as /35)", f"{pack.total} / 35")
-    with c2:
-        st.metric("Coverage", f"{coverage}%")
-    with c3:
-        st.metric("Spike Bonus (raw)", f"+{pack.bonus}")
-
-    # Band explanation (always visible)
-    st.info(f"**{pack.band_label}** — {pack.band_explain}")
-
-    # Evidence by trait
-    st.markdown("#### Evidence by Trait")
-    for t in traits:
-        st.markdown(f"**{t.get('label','?')}** — score {t.get('score','?')}" + (" · **Spike**" if t.get("spike") else ""))
-        for e in (t.get("evidence") or [])[:3]:
-            st.write(f"- {e}")
-        st.markdown("")
-
-    # Auto summary (editable)
-    st.markdown("#### Analyst Summary (auto-generated; edit if needed)")
-    st.text_area("", value=overall_sum, height=120)
-
-    # Methodology + transparent rules
-    with st.expander("How this grading works (methodology)"):
-        if methodology:
-            for m in methodology:
-                st.write(f"- {m}")
-            st.markdown("---")
-        st.write("**Rubric bands (transparent):**")
-        st.write("- **Strong Signal (26–35):** Bring to Partner likely.")
-        st.write("- **Moderate Signal (18–25.9):** Promising; needs more evidence.")
-        st.write("- **Weak Signal (<18):** Probably pass for now unless there’s a compelling wedge.")
-        st.write(f"**Spike weighting:** each spiking trait ×{SPIKE_MULTIPLIER}.")
-
-    if flags:
-        with st.expander("Auto-detected flags / caveats"):
-            for f in flags:
-                st.write(f"- {f}")
+    # (Optional) persist: left as a no-op to avoid side effects
+    return {
+        "score_final": final_score,
+        "score_base": base_total,
+        "coverage_pct": coverage_pct,
+        "bonus": bonus,
+        "traits": traits,
+        "signals": per_signal,
+    }
