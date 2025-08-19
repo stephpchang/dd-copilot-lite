@@ -1,10 +1,10 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.12.4 — Founder Potential: clearer copy + legend + collapse raw panel; Founder Brief: context + skim-first chips
+# v0.12.5 — clearer Founder Potential (score formula + legend + collapsed raw panel)
+#           + context-first Founder Brief (chips + skim)
 
 import os
 import re
-import sys
 import json
 import html
 import requests
@@ -36,7 +36,6 @@ st.markdown(
     <style>
       .block-container { max-width: 980px; margin: auto; }
       .stCaption { opacity: .75 }
-      /* tighter expander body */
       div.streamlit-expanderContent { padding-top: .5rem; }
     </style>
     """,
@@ -44,7 +43,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.12.4 — clearer Founder Potential + context-first Founder Brief")
+st.caption("Build: v0.12.5 — clearer Founder Potential + context-first Founder Brief")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -223,7 +222,6 @@ def _extract_names(text: str) -> list[str]:
     for m in NAME_RE.findall(text):
         candidate = m.strip()
         parts = candidate.split()
-
         if any(len(p) < 2 or not p.isalpha() for p in parts):
             continue
         if any(p in BLACKLIST_TOKENS for p in parts):
@@ -232,7 +230,6 @@ def _extract_names(text: str) -> list[str]:
             continue
         if len(parts) > 3:
             continue
-
         out.append(candidate)
     return out
 
@@ -461,14 +458,25 @@ if submitted and name:
     )
     st.markdown(chips, unsafe_allow_html=True)
 
-    # Legend / labels
+    # Legend / score formula (explicit bonus explanation)
     with st.expander("How this score works", expanded=False):
         st.markdown(
-            "- **Score (out of 35):** 7 founder signals × up to 5 points each.\n"
-            "- **Signal coverage:** how many of the 7 signals we could verify from public sources.\n"
-            "- **Standout bonus (up to +5):** extra points for high-signal traits visible in public info "
+            "**Score formula**\n"
+            "- **Base (out of 35):** 7 founder signals × up to 5 points each.\n"
+            "- **Bonus (0–5):** added for standout traits visible in public sources "
             "(e.g., repeat founder, strong technical background, fast product cadence).\n"
-            "- This is **directional**. Use it to shape questions; final judgment is human."
+            "- **Final score (max 40) = Base + Bonus.**\n"
+        )
+        st.markdown(
+            "**Label map (what you’ll see in the detailed panel)**\n"
+            "- *Standout traits (public)* — traits that earned bonus points; if none, bonus is 0.\n"
+            "- *Bonus (0–5)* — exact bonus points applied.\n"
+            "- *Signal coverage* — % of the 7 signals we could verify from public info.\n"
+        )
+        st.markdown(
+            "**Tips**\n"
+            "- If coverage is low, paste a founder LinkedIn/About link above and re-run.\n"
+            "- Treat this as **triage**, not a decision—use it to shape questions."
         )
 
     # Raw scoring UI (original panel) behind details
