@@ -1,12 +1,9 @@
 # app/founder_scoring.py
-# Founder Potential panel (clarified labels)
-# Computes a coarse, first-pass score from public signals passed in by the app.
-# Score = Base (out of 35; 7 signals × 5) + Bonus (0–5) for standout traits.
-# This is a directional triage aid — not a decision.
+# Founder Potential panel — headline /35, bonus separate, coverage = score>0, no integrity floor.
+# Directional triage aid; not a decision.
 
 from __future__ import annotations
 
-import re
 import html
 import streamlit as st
 from urllib.parse import urlparse
@@ -40,14 +37,14 @@ def _score_signal(
     funding_stats: Dict[str, Any],
 ) -> tuple[int, List[str]]:
     """Return (score_0_to_5, evidence_lines) using light-touch heuristics."""
-    ev = []
+    ev: List[str] = []
     score = 0
     domains = [_domain(u) for u in (sources_list or [])]
 
     # Domain insight
     if name == "Domain insight":
         if len(wiki_summary or "") > 300:
-            score += 3; ev.append("Substantive background (Wikipedia summary present).")
+            score += 3; ev.append("Substantive bio/background visible (e.g., Wikipedia).")
         if any(d for d in domains if d.endswith(("substack.com","medium.com","github.com","readthedocs.io"))):
             score += 1; ev.append("Public writing/docs signal.")
         if funding_stats.get("total_usd"):
@@ -58,7 +55,7 @@ def _score_signal(
     elif name == "Execution":
         if any(d for d in domains if "github.com" in d or "docs." in d or "changelog" in d):
             score += 2; ev.append("Code/docs/changelog present.")
-        if any("release" in u.lower() for u in (sources_list or [])):
+        if any("release" in (u or "").lower() for u in (sources_list or [])):
             score += 1; ev.append("Release notes in sources.")
         if funding_stats.get("largest", {}).get("date"):
             score += 1; ev.append("Recent round suggests delivery momentum.")
@@ -68,7 +65,7 @@ def _score_signal(
 
     # Hiring pull
     elif name == "Hiring pull":
-        if any("linkedin.com/in" in u for u in (sources_list or [])):
+        if any("linkedin.com/in" in (u or "") for u in (sources_list or [])):
             score += 2; ev.append("Founder LinkedIn signals team magnetism.")
         if any(d for d in domains if "jobs" in d or "greenhouse.io" in d or "lever.co" in d):
             score += 1; ev.append("Active hiring page.")
@@ -94,7 +91,7 @@ def _score_signal(
     elif name == "Customer focus":
         if any(d for d in domains if "g2.com" in d or "capterra.com" in d or "case" in d):
             score += 2; ev.append("Customer reviews/case studies.")
-        if any("customers" in u.lower() or "case-study" in u.lower() for u in (sources_list or [])):
+        if any("customers" in (u or "").lower() or "case-study" in (u or "").lower() for u in (sources_list or [])):
             score += 1; ev.append("Customer content in sources.")
         if _has_any(wiki_summary, ["customer", "users", "clients"]):
             score += 1; ev.append("Customer orientation mentioned.")
@@ -104,7 +101,7 @@ def _score_signal(
 
     # Learning speed
     elif name == "Learning speed":
-        if any("changelog" in u.lower() or "release notes" in u.lower() for u in (sources_list or [])):
+        if any("changelog" in (u or "").lower() or "release notes" in (u or "").lower() for u in (sources_list or [])):
             score += 2; ev.append("Frequent updates implied.")
         if any(d for d in domains if "github.com" in d):
             score += 1; ev.append("Github present.")
@@ -114,20 +111,19 @@ def _score_signal(
             score += 1; ev.append("Roadmap/iteration artifacts.")
         score = min(score, 5)
 
-    # Integrity (very conservative / proxy-based)
+    # Integrity (NO floor; can be 0 if no evidence)
     elif name == "Integrity":
         if any(d for d in domains if "wikipedia.org" in d or "crunchbase.com" in d or "linkedin.com" in d):
             score += 2; ev.append("Verified public profiles.")
         if _has_any(wiki_summary, ["nonprofit","ethics","open source","license"]):
             score += 1; ev.append("Values/work transparency noted.")
-        # No negative-signal scraping; keep this as a light positive prior
-        score = min(max(score, 1), 5)  # ensure non-zero baseline if any evidence gathered
+        score = min(max(score, 0), 5)
 
     return score, ev
 
 def _bonus_and_traits(wiki_summary: str, founder_hint: str | None, sources_list: List[str]) -> tuple[int, List[str]]:
-    """Return (bonus_0_to_5, traits_list)."""
-    traits = []
+    """Return (bonus_0_to_5, traits_list).  Bonus is NOT added to headline score."""
+    traits: List[str] = []
     bonus = 0
     text = (wiki_summary or "") + " " + (founder_hint or "")
     text_l = text.lower()
@@ -148,9 +144,7 @@ def _bonus_and_traits(wiki_summary: str, founder_hint: str | None, sources_list:
         traits.append("Visible product cadence")
         bonus += 1
 
-    # Cap at 5
-    bonus = min(bonus, 5)
-    return bonus, traits
+    return min(bonus, 5), traits
 
 def auto_founder_scoring_panel(
     company_name: str,
@@ -161,31 +155,32 @@ def auto_founder_scoring_panel(
     market_size: Dict[str, Any] | None = None,
     persist_path: str | None = None,
 ):
-    """Render the Founder Potential panel with clarified labels and breakdown."""
+    """Render the Founder Potential panel with /35 headline score and separate bonus."""
     st.markdown("### Detailed scoring")
     st.caption("Directional, first-pass signals compiled from public sources.")
 
-    # Per-signal scoring
-    per_signal = {}
+    per_signal: Dict[str, Dict[str, Any]] = {}
     coverage_hits = 0
     base_total = 0
+
+    # Per-signal scoring
     for sig in SEVEN_SIGNALS:
         sc, ev = _score_signal(sig, wiki_summary, founder_hint, sources_list, funding_stats)
         per_signal[sig] = {"score": sc, "evidence": ev}
-        if ev:
+        if sc > 0:  # coverage counts signals with score>0
             coverage_hits += 1
         base_total += sc
 
     coverage_pct = int(round((coverage_hits / len(SEVEN_SIGNALS)) * 100)) if SEVEN_SIGNALS else 0
     bonus, traits = _bonus_and_traits(wiki_summary, founder_hint, sources_list)
-    final_score = min(base_total + bonus, 40)
+    combined = min(base_total + bonus, 40)
 
-    # Headline metrics
+    # Headline metrics — /35 main, bonus separate, combined shown as reference
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Score (out of 40)", f"{final_score:.1f}")
-    c2.metric("Base (out of 35)", f"{base_total:.1f}")
-    c3.metric("Signal coverage", f"{coverage_pct}%")
-    c4.metric("Bonus (0–5)", f"+{bonus:.1f}")
+    c1.metric("Score (out of 35)", f"{base_total:.1f}")
+    c2.metric("Signal coverage", f"{coverage_pct}%")
+    c3.metric("Bonus (0–5)", f"+{bonus:.1f}")
+    c4.metric("Score+Bonus (max 40)", f"{combined:.1f}")
 
     # Standout traits
     if traits:
@@ -206,12 +201,12 @@ def auto_founder_scoring_panel(
             for ev in row["evidence"]:
                 st.write(f"   • {ev}")
 
-    # (Optional) persist: left as a no-op to avoid side effects
+    # (Optional) return structure for future use
     return {
-        "score_final": final_score,
         "score_base": base_total,
         "coverage_pct": coverage_pct,
         "bonus": bonus,
+        "score_combined": combined,
         "traits": traits,
         "signals": per_signal,
     }
