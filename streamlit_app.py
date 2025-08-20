@@ -1,26 +1,23 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.12.6 — revert headline score to /35; bonus shown separately; coverage=signals with score>0
-#            keep clearer Founder Potential legend + context-first Founder Brief
+# v0.13.0 — restores original 7-trait rubric labels; clarifies spike bonus; indexless tables; founder detection explainer
 
 import os
 import re
 import json
 import html
 import requests
+import pandas as pd
 import streamlit as st
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
-# ---------------------------
-# Local modules (unchanged)
-# ---------------------------
+# --- Local modules ---
 from app.llm_guard import generate_once
 from app.public_provider import wiki_enrich
 from app.funding_lookup import get_funding_data
 from app.market_size import get_market_size
 
-# Founder Potential auto panel
 try:
     from app.founder_scoring import auto_founder_scoring_panel
 except Exception as e:
@@ -43,7 +40,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.12.6 — headline score back to /35; bonus separate; clearer legend")
+st.caption("Build: v0.13.0 — original 7-trait rubric; clearer tables; founder detection explainer")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -163,7 +160,7 @@ def tidy(results, prefer=(), limit=3):
     return cleaned[:limit]
 
 # ===============================================================
-# Funding helpers (unchanged)
+# Funding helpers
 # ===============================================================
 def _funding_stats(funding: dict) -> dict:
     rounds = (funding or {}).get("rounds") or []
@@ -198,17 +195,15 @@ def funding_glance_sentence(stats: dict) -> str:
     return " · ".join(parts) if parts else "No public funding details found."
 
 # ===============================================================
-# Founder detection (robust)
+# Founder name detection (w/ evidence)
 # ===============================================================
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
-
 BLACKLIST_TOKENS = {
     "Inc","LLC","Ltd","Series","Founder","CEO","Co",
     "Cofounder","Co-founder","Founder/CEO","University","College",
     "Institute","Lab","Labs","School","Center","Research","Foundation",
     "Holdings","Capital","Ventures","Official","Profile","View","Press"
 }
-
 LOCATION_BLACKLIST = {
     "San Francisco","New York","London","Boston","Los Angeles","Silicon Valley",
     "United States","USA","California","Texas","Paris","Berlin","Toronto",
@@ -222,14 +217,10 @@ def _extract_names(text: str) -> list[str]:
     for m in NAME_RE.findall(text):
         candidate = m.strip()
         parts = candidate.split()
-        if any(len(p) < 2 or not p.isalpha() for p in parts):
-            continue
-        if any(p in BLACKLIST_TOKENS for p in parts):
-            continue
-        if candidate in LOCATION_BLACKLIST:
-            continue
-        if len(parts) > 3:
-            continue
+        if any(len(p) < 2 or not p.isalpha() for p in parts): continue
+        if any(p in BLACKLIST_TOKENS for p in parts): continue
+        if candidate in LOCATION_BLACKLIST: continue
+        if len(parts) > 3: continue
         out.append(candidate)
     return out
 
@@ -238,7 +229,6 @@ def detect_founders_with_evidence(company: str):
     """Return (top_names, evidence_dict[name] -> {score, sources}, all_urls)"""
     if not company:
         return [], {}, []
-
     queries = [
         f"{company} founder",
         f"{company} cofounder",
@@ -250,12 +240,10 @@ def detect_founders_with_evidence(company: str):
         f"site:wikipedia.org {company} founder",
         f"{company} press release founder",
     ]
-
     from collections import Counter, defaultdict
     scores = Counter()
     evidence = defaultdict(lambda: {"score": 0, "sources": set()})
     all_urls = []
-
     for q in queries:
         for item in serp(q, num=3):
             ttl = item.get("title","") or ""
@@ -263,20 +251,16 @@ def detect_founders_with_evidence(company: str):
             url = item.get("url","") or ""
             dom = _domain(url)
             if url: all_urls.append(url)
-
             text = f"{ttl}. {sn}"
             names = _extract_names(text)
-
             boost = 3 if "founder" in q.lower() else 1
             if "linkedin.com/in" in url: boost += 2
             if "wikipedia.org"   in url: boost += 2
             if "techcrunch.com"  in url or "press" in url: boost += 1
-
             for n in names:
                 scores[n] += boost
                 evidence[n]["score"] += boost
                 if dom: evidence[n]["sources"].add(dom)
-
     ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
     top = [nm for nm, _ in ranked][:3]
     ev = {nm: {"score": evidence[nm]["score"], "sources": sorted(list(evidence[nm]["sources"]))[:3]} for nm in top}
@@ -359,6 +343,7 @@ for key, default in [
     ("gen_market_map", True),
     ("_busy", False),
     ("llm_data", None),
+    ("fb_compact", True),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -394,16 +379,30 @@ if submitted and name:
 
     # --- Gather signals
     with st.spinner("Gathering public signals..."):
-        overview_results = tidy(serp(f"{name} official site"), prefer=("about","wikipedia.org","crunchbase.com","linkedin.com"))
-        team_results     = tidy(serp(f"{name} founders team leadership"), prefer=("about","team","wikipedia.org","linkedin.com","crunchbase.com"))
-        market_results   = tidy(serp(f"{name} target market TAM customers industry"), prefer=("gartner.com","forrester.com","mckinsey.com","bain.com"))
-        competition_results = tidy(serp(f"{name} competitors alternatives comparative"), prefer=("g2.com","capterra.com","crunchbase.com","wikipedia.org"))
+        overview_results = tidy(
+            serp(f"{name} official site"),
+            prefer=("about","wikipedia.org","crunchbase.com","linkedin.com")
+        )
+        team_results = tidy(
+            serp(f"{name} founders team leadership"),
+            prefer=("about","team","wikipedia.org","linkedin.com","crunchbase.com")
+        )
+        market_results = tidy(
+            serp(f"{name} target market TAM customers industry"),
+            prefer=("gartner.com","forrester.com","mckinsey.com","bain.com")
+        )
+        competition_results = tidy(
+            serp(f"{name} competitors alternatives comparative"),
+            prefer=("g2.com","capterra.com","crunchbase.com","wikipedia.org")
+        )
 
     wiki = wiki_enrich(name)  # {"title","url","summary"} or None
 
+    # --- Funding & Investors
     funding = get_funding_data(name, serp_func=lambda q, num=3: serp(q, num))
     funding_stats = _funding_stats(funding)
 
+    # --- Market Size (TAM)
     market_size = get_market_size(name, serp_func=lambda q, num=3: serp(q, num))
     def _best_tam_line(ms: dict) -> str:
         ests = (ms or {}).get("estimates") or []
@@ -428,29 +427,28 @@ if submitted and name:
     detected, evidence, founder_urls = detect_founders_with_evidence(name)
     founder_hint = ", ".join(detected) if detected else ""
     founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
-    if evidence:
-        st.caption("Founder detection evidence (public sources):")
-        rows = [{"Name": nm, "Score": evidence[nm]["score"], "Sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
-        st.table(rows)
 
-    # --- Founder Potential (automatic) — /35 headline + separate bonus
+    if evidence:
+        st.caption("Founder detection (public sources) — evidence score ranks likely names. It is NOT the /35 founder score.")
+        rows = [{"Name": nm, "Evidence score": evidence[nm]["score"], "Top sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
+        rows = sorted(rows, key=lambda r: r["Evidence score"], reverse=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # -------------------------------
+    # Founder Potential
+    # -------------------------------
     st.markdown("## Founder Potential (first-pass signals)")
     st.caption(
         "Quick, automated read from public sources — use this to **triage**, not decide. "
         "Add a founder’s LinkedIn or About page above and re-run for better coverage."
     )
 
-    # Context chips
+    # chips
     summary_bits = []
-    if detected:
-        summary_bits.append(f"Founders: {', '.join(detected)}")
-    else:
-        summary_bits.append("Founders not confidently identified")
-    if funding_stats.get("total_usd"):
-        summary_bits.append(f"Public funding: {_abbr_usd(funding_stats['total_usd'])}")
-    if wiki and wiki.get("summary"):
-        summary_bits.append("Wikipedia summary found")
-
+    if detected: summary_bits.append(f"Founders: {', '.join(detected)}")
+    else: summary_bits.append("Founders not confidently identified")
+    if funding_stats.get("total_usd"): summary_bits.append(f"Public funding: {_abbr_usd(funding_stats['total_usd'])}")
+    if wiki and wiki.get("summary"): summary_bits.append("Wikipedia summary found")
     chips = " ".join(
         f"<span style='background:#f1f5f9;border:1px solid #e2e8f0;border-radius:999px;"
         f"padding:2px 8px;font-size:12px;color:#334155'>{html.escape(bit)}</span>"
@@ -458,17 +456,17 @@ if submitted and name:
     )
     st.markdown(chips, unsafe_allow_html=True)
 
-    # Legend — base only in headline; bonus separate; coverage = score>0
     with st.expander("How this score works", expanded=False):
         st.markdown(
-            "- **Score (out of 35):** 7 founder signals × up to 5 points each. This is the headline score.\n"
-            "- **Bonus (0–5):** shown separately for standout traits from public sources "
-            "(e.g., repeat founder, strong technical background, fast product cadence). **Not added** to the headline.\n"
-            "- **Coverage:** % of signals with **score > 0** (evidence-based).\n"
-            "- If you want a combined view, mentally add Score + Bonus (max 40), but we report /35 to avoid over-weighting sparse traits."
+            "- **Score (out of 35):** 7 signals × up to 5 points each: "
+            "**Domain Depth**, **Unconventional / Rigorous Journey**, **High-Fidelity Thinking**, "
+            "**Magnetism & Movement-Building**, **Velocity Without Capital**, **Narrative Control**, "
+            "**Technology Literacy + Imagination**.\n"
+            "- **Bonus (0–5):** shown separately for spiking traits. **Not added** to the headline.\n"
+            "- **Coverage:** % of signals with **score > 0**.\n"
+            "- If you want a combined view, you can add Score + Bonus (max 40)."
         )
 
-    # Raw scoring UI (original panel) behind details
     with st.expander("Detailed scoring (show)", expanded=False):
         if auto_founder_scoring_panel:
             sources_for_scoring = _dedup_list(sources_list + founder_urls)[:15]
@@ -496,6 +494,7 @@ if submitted and name:
                 if data is None:
                     try:
                         wiki_hint = (wiki.get("summary")[:600] if wiki and wiki.get("summary") else "").strip()
+
                         ms_hints = []
                         for e in (market_size.get("estimates") or [])[:3]:
                             amt = e.get("amount_usd"); year = e.get("year") or "n/a"; scope = e.get("scope") or "Market size"
@@ -596,7 +595,7 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.caption("LLM summary unavailable. See Signals section for public sources.")
 
     # -------------------------------
-    # Founder Brief — context-first skim view
+    # Founder Brief — renders from saved JSON
     # -------------------------------
     with st.expander("Founder Brief", expanded=False):
         data = st.session_state.llm_data
@@ -608,38 +607,35 @@ Return ONLY the JSON object; no markdown, no commentary.
             highlights   = [x for x in (fb.get("highlights") or []) if x]
             open_qs      = [x for x in (fb.get("open_questions") or []) if x]
 
-            # Parse founder lines into (name, role, blurb)
+            # parse names + blurbs
             founders = []
             for line in founders_raw:
                 parts = re.split(r"\s+[-—]\s+", str(line), 1)
                 name  = parts[0].strip()
                 blurb = parts[1].strip() if len(parts) > 1 else ""
-                role_match = re.search(
-                    r"\b(CEO|CTO|COO|CFO|Chief [A-Za-z]+|[Cc]o-?founder|Founder|Head of [A-Za-z ]+)\b",
-                    blurb
-                )
-                role = role_match.group(0) if role_match else "Founder"
+                role = "Founder"
+                m = re.search(r"\b(CEO|CTO|COO|CFO|Chief [A-Za-z]+|[Cc]o-?founder|Founder|Head of [A-Za-z ]+)\b", blurb)
+                if m: role = m.group(0)
                 founders.append((name, role, blurb))
 
-            # ---------- Context first ----------
             st.markdown("**How to read this**")
             st.caption(
-                "This section supports first-pass founder assessment using a seven-signal rubric "
-                "(domain insight, execution, hiring pull, communication, customer focus, learning speed, integrity). "
-                "Start with the quick takeaways below, then scan the bios."
+                "Supports first-pass founder assessment with a seven-signal rubric "
+                "(Domain Depth, Unconventional / Rigorous Journey, High-Fidelity Thinking, "
+                "Magnetism & Movement-Building, Velocity Without Capital, Narrative Control, "
+                "Technology Literacy + Imagination). "
+                "Use the at-a-glance view first, then scan the bios."
             )
 
-            # Compact skim view
-            compact = st.checkbox("Compact view", value=True, help="Show only at-a-glance + top takeaways.")
+            compact = st.checkbox("Compact view", key="fb_compact", help="Show only at-a-glance + top takeaways.")
 
             cols = st.columns(2)
             with cols[0]:
                 st.markdown("**Founders (at a glance)**")
                 if founders:
                     chips = " ".join([
-                        f"<span style='background:#eef2ff;border:1px solid #c7d2fe;"
-                        f"border-radius:999px;padding:2px 8px;font-size:12px;color:#3730a3'>"
-                        f"{html.escape(n)} · {html.escape(r)}</span>"
+                        f"<span style='background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;"
+                        f"padding:2px 8px;font-size:12px;color:#3730a3'>{html.escape(n)} · {html.escape(r)}</span>"
                         for (n, r, _) in founders[:6]
                     ])
                     st.markdown(chips, unsafe_allow_html=True)
@@ -650,33 +646,25 @@ Return ONLY the JSON object; no markdown, no commentary.
                 st.markdown("**Read this first**")
                 read_first = []
                 read_first.extend(highlights[:2])
-                if open_qs:
-                    read_first.append(open_qs[0])
+                if open_qs: read_first.append(open_qs[0])
                 if read_first:
-                    for p in read_first:
-                        st.write(f"- {p}")
+                    for p in read_first: st.write(f"- {p}")
                 else:
                     st.caption("No highlights or open questions found in the brief.")
 
             if not compact:
                 st.divider()
-                # Full bios
                 if founders:
                     st.markdown("**Founder bios**")
                     for name, role, blurb in founders:
-                        if blurb:
-                            st.write(f"- **{name}** ({role}) — {blurb}")
-                        else:
-                            st.write(f"- **{name}** ({role})")
-                # Additional details
+                        if blurb: st.write(f"- **{name}** ({role}) — {blurb}")
+                        else:     st.write(f"- **{name}** ({role})")
                 if highlights:
                     st.markdown("**Additional highlights**")
-                    for h in highlights[:8]:
-                        st.write(f"- {h}")
+                    for h in highlights[:8]: st.write(f"- {h}")
                 if open_qs:
                     st.markdown("**Open questions**")
-                    for q in open_qs[:6]:
-                        st.write(f"- {q}")
+                    for q in open_qs[:6]: st.write(f"- {q}")
                 if not any([founders, highlights, open_qs]):
                     st.caption("No structured founder details in the current JSON output.")
 
@@ -692,23 +680,19 @@ Return ONLY the JSON object; no markdown, no commentary.
             axes = [x for x in (mm.get("axes") or []) if x]
             competitors = [x for x in (mm.get("competitors") or []) if x]
             diffs = [x for x in (mm.get("differentiators") or []) if x]
-
             if axes:
-                st.markdown("**Positioning Axes**")
-                st.write(", ".join(axes))
+                st.markdown("**Positioning Axes**"); st.write(", ".join(axes))
             if competitors:
                 st.markdown("**Competitors**")
-                for c in competitors[:10]:
-                    st.write(f"- {c}")
+                for c in competitors[:10]: st.write(f"- {c}")
             if diffs:
                 st.markdown("**Differentiators**")
-                for d in diffs[:8]:
-                    st.write(f"- {d}")
+                for d in diffs[:8]: st.write(f"- {d}")
             if not any([axes, competitors, diffs]):
                 st.caption("No structured market map in the current JSON output.")
 
     # -------------------------------
-    # Market Size & Revenue — prefer JSON if present; fall back to TAM line
+    # Market Size & Revenue — prefer JSON; fall back to TAM line
     # -------------------------------
     with st.expander("Market Size & Revenue", expanded=False):
         data = st.session_state.llm_data
