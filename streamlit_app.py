@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.13.0 — restores original 7-trait rubric labels; clarifies spike bonus; indexless tables; founder detection explainer
+# v0.13.2 — Founder Brief tabs (no jump); “Standout” wording; tighter founder detection
 
 import os
 import re
@@ -40,7 +40,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.13.0 — original 7-trait rubric; clearer tables; founder detection explainer")
+st.caption("Build: v0.13.2 — Founder Brief tabs (no jump); “Standout” wording; tighter founder detection")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -98,7 +98,7 @@ def serp(query: str, num: int = 3):
             except Exception:
                 pass
 
-            title = html.unescape(re.sub("<.*?>", "", title_html)).strip()
+        title = html.unescape(re.sub("<.*?>", "", title_html)).strip()
             snippet = ""
             if i < len(snips):
                 snippet = html.unescape(re.sub("<.*?>", "", snips[i])).strip()
@@ -195,7 +195,7 @@ def funding_glance_sentence(stats: dict) -> str:
     return " · ".join(parts) if parts else "No public funding details found."
 
 # ===============================================================
-# Founder name detection (w/ evidence)
+# Founder name detection (tightened to avoid false positives)
 # ===============================================================
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 BLACKLIST_TOKENS = {
@@ -209,6 +209,11 @@ LOCATION_BLACKLIST = {
     "United States","USA","California","Texas","Paris","Berlin","Toronto",
     "Chicago","Miami","Seattle","Austin","Dublin","Bengaluru","Tokyo"
 }
+STOP_NAMES = {
+    "The State","About Us","About","Contact Us","Contact","Privacy Policy","Terms of Service",
+    "Press Release","Press Room","Help Center","Home Page","Home"
+}
+FOUNDER_CONTEXT_TOKENS = ("founder","cofounder","co-founder","ceo","cto","cpo","coo")
 
 def _extract_names(text: str) -> list[str]:
     if not text:
@@ -220,13 +225,17 @@ def _extract_names(text: str) -> list[str]:
         if any(len(p) < 2 or not p.isalpha() for p in parts): continue
         if any(p in BLACKLIST_TOKENS for p in parts): continue
         if candidate in LOCATION_BLACKLIST: continue
+        if candidate in STOP_NAMES: continue
         if len(parts) > 3: continue
         out.append(candidate)
     return out
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def detect_founders_with_evidence(company: str):
-    """Return (top_names, evidence_dict[name] -> {score, sources}, all_urls)"""
+    """
+    Return (top_names, evidence_dict[name] -> {score, sources}, all_urls)
+    Requires founder-context tokens or trusted person sources to count a name.
+    """
     if not company:
         return [], {}, []
     queries = [
@@ -244,6 +253,7 @@ def detect_founders_with_evidence(company: str):
     scores = Counter()
     evidence = defaultdict(lambda: {"score": 0, "sources": set()})
     all_urls = []
+
     for q in queries:
         for item in serp(q, num=3):
             ttl = item.get("title","") or ""
@@ -251,16 +261,30 @@ def detect_founders_with_evidence(company: str):
             url = item.get("url","") or ""
             dom = _domain(url)
             if url: all_urls.append(url)
+
             text = f"{ttl}. {sn}"
+            text_l = text.lower()
             names = _extract_names(text)
-            boost = 3 if "founder" in q.lower() else 1
-            if "linkedin.com/in" in url: boost += 2
-            if "wikipedia.org"   in url: boost += 2
-            if "techcrunch.com"  in url or "press" in url: boost += 1
+
+            trusted_person_source = (
+                ("linkedin.com/in" in url) or
+                ("wikipedia.org" in url) or
+                ("crunchbase.com/person" in url)
+            )
+            context_ok = trusted_person_source or any(tok in text_l for tok in FOUNDER_CONTEXT_TOKENS)
+
+            base_boost = 3 if "founder" in q.lower() else 1
+            if "linkedin.com/in" in url: base_boost += 2
+            if "wikipedia.org"   in url: base_boost += 2
+            if "techcrunch.com"  in url or "press" in url: base_boost += 1
+
             for n in names:
-                scores[n] += boost
-                evidence[n]["score"] += boost
+                if not context_ok:
+                    continue
+                scores[n] += base_boost
+                evidence[n]["score"] += base_boost
                 if dom: evidence[n]["sources"].add(dom)
+
     ranked = sorted(scores.items(), key=lambda kv: (kv[1], len(evidence[kv[0]]["sources"])), reverse=True)
     top = [nm for nm, _ in ranked][:3]
     ev = {nm: {"score": evidence[nm]["score"], "sources": sorted(list(evidence[nm]["sources"]))[:3]} for nm in top}
@@ -343,7 +367,6 @@ for key, default in [
     ("gen_market_map", True),
     ("_busy", False),
     ("llm_data", None),
-    ("fb_compact", True),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -429,7 +452,7 @@ if submitted and name:
     founder_hint = st.text_input("Founder (optional — override or confirm)", value=founder_hint, help="Comma-separated if multiple.")
 
     if evidence:
-        st.caption("Founder detection (public sources) — evidence score ranks likely names. It is NOT the /35 founder score.")
+        st.caption("Founder detection (public sources) — evidence score ranks likely names. It is **not** the /35 founder score.")
         rows = [{"Name": nm, "Evidence score": evidence[nm]["score"], "Top sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
         rows = sorted(rows, key=lambda r: r["Evidence score"], reverse=True)
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -462,9 +485,10 @@ if submitted and name:
             "**Domain Depth**, **Unconventional / Rigorous Journey**, **High-Fidelity Thinking**, "
             "**Magnetism & Movement-Building**, **Velocity Without Capital**, **Narrative Control**, "
             "**Technology Literacy + Imagination**.\n"
-            "- **Bonus (0–5):** shown separately for spiking traits. **Not added** to the headline.\n"
+            "- **Standout bonus (0–5):** extra credit when evidence is **exceptional for the stage**. "
+            "Shown separately; not added to the headline.\n"
             "- **Coverage:** % of signals with **score > 0**.\n"
-            "- If you want a combined view, you can add Score + Bonus (max 40)."
+            "- If you want a combined view, you can add Score + Standout bonus (max 40)."
         )
 
     with st.expander("Detailed scoring (show)", expanded=False):
@@ -595,9 +619,9 @@ Return ONLY the JSON object; no markdown, no commentary.
             st.caption("LLM summary unavailable. See Signals section for public sources.")
 
     # -------------------------------
-    # Founder Brief — renders from saved JSON
+    # Founder Brief — tabs (Compact vs Full)
     # -------------------------------
-    with st.expander("Founder Brief", expanded=False):
+    with st.expander("Founder Brief", expanded=True):
         data = st.session_state.llm_data
         if not data or not isinstance(data, dict):
             st.info("No founder brief generated yet. Enable 'Generate Investor Summary' and run again.")
@@ -623,37 +647,35 @@ Return ONLY the JSON object; no markdown, no commentary.
                 "Supports first-pass founder assessment with a seven-signal rubric "
                 "(Domain Depth, Unconventional / Rigorous Journey, High-Fidelity Thinking, "
                 "Magnetism & Movement-Building, Velocity Without Capital, Narrative Control, "
-                "Technology Literacy + Imagination). "
-                "Use the at-a-glance view first, then scan the bios."
+                "Technology Literacy + Imagination). Use the **At a glance** tab first."
             )
 
-            compact = st.checkbox("Compact view", key="fb_compact", help="Show only at-a-glance + top takeaways.")
+            tab_glance, tab_full = st.tabs(["At a glance", "Full details"])
 
-            cols = st.columns(2)
-            with cols[0]:
-                st.markdown("**Founders (at a glance)**")
-                if founders:
-                    chips = " ".join([
-                        f"<span style='background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;"
-                        f"padding:2px 8px;font-size:12px;color:#3730a3'>{html.escape(n)} · {html.escape(r)}</span>"
-                        for (n, r, _) in founders[:6]
-                    ])
-                    st.markdown(chips, unsafe_allow_html=True)
-                else:
-                    st.caption("No founders parsed from the brief.")
+            with tab_glance:
+                cols = st.columns(2)
+                with cols[0]:
+                    st.markdown("**Founders (at a glance)**")
+                    if founders:
+                        chips = " ".join([
+                            f"<span style='background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;"
+                            f"padding:2px 8px;font-size:12px;color:#3730a3'>{html.escape(n)} · {html.escape(r)}</span>"
+                            for (n, r, _) in founders[:6]
+                        ])
+                        st.markdown(chips, unsafe_allow_html=True)
+                    else:
+                        st.caption("No founders parsed from the brief.")
+                with cols[1]:
+                    st.markdown("**Read this first**")
+                    read_first = []
+                    read_first.extend(highlights[:2])
+                    if open_qs: read_first.append(open_qs[0])
+                    if read_first:
+                        for p in read_first: st.write(f"- {p}")
+                    else:
+                        st.caption("No highlights or open questions found.")
 
-            with cols[1]:
-                st.markdown("**Read this first**")
-                read_first = []
-                read_first.extend(highlights[:2])
-                if open_qs: read_first.append(open_qs[0])
-                if read_first:
-                    for p in read_first: st.write(f"- {p}")
-                else:
-                    st.caption("No highlights or open questions found in the brief.")
-
-            if not compact:
-                st.divider()
+            with tab_full:
                 if founders:
                     st.markdown("**Founder bios**")
                     for name, role, blurb in founders:
