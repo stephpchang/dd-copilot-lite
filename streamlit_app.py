@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.12.5 — clearer Founder Potential (score formula + legend + collapsed raw panel)
-#           + context-first Founder Brief (chips + skim)
+# v0.12.6 — revert headline score to /35; bonus shown separately; coverage=signals with score>0
+#            keep clearer Founder Potential legend + context-first Founder Brief
 
 import os
 import re
@@ -43,7 +43,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.12.5 — clearer Founder Potential + context-first Founder Brief")
+st.caption("Build: v0.12.6 — headline score back to /35; bonus separate; clearer legend")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -433,7 +433,7 @@ if submitted and name:
         rows = [{"Name": nm, "Score": evidence[nm]["score"], "Sources": ", ".join(evidence[nm]["sources"])} for nm in evidence]
         st.table(rows)
 
-    # --- Founder Potential (automatic) — clarified UX
+    # --- Founder Potential (automatic) — /35 headline + separate bonus
     st.markdown("## Founder Potential (first-pass signals)")
     st.caption(
         "Quick, automated read from public sources — use this to **triage**, not decide. "
@@ -458,25 +458,14 @@ if submitted and name:
     )
     st.markdown(chips, unsafe_allow_html=True)
 
-    # Legend / score formula (explicit bonus explanation)
+    # Legend — base only in headline; bonus separate; coverage = score>0
     with st.expander("How this score works", expanded=False):
         st.markdown(
-            "**Score formula**\n"
-            "- **Base (out of 35):** 7 founder signals × up to 5 points each.\n"
-            "- **Bonus (0–5):** added for standout traits visible in public sources "
-            "(e.g., repeat founder, strong technical background, fast product cadence).\n"
-            "- **Final score (max 40) = Base + Bonus.**\n"
-        )
-        st.markdown(
-            "**Label map (what you’ll see in the detailed panel)**\n"
-            "- *Standout traits (public)* — traits that earned bonus points; if none, bonus is 0.\n"
-            "- *Bonus (0–5)* — exact bonus points applied.\n"
-            "- *Signal coverage* — % of the 7 signals we could verify from public info.\n"
-        )
-        st.markdown(
-            "**Tips**\n"
-            "- If coverage is low, paste a founder LinkedIn/About link above and re-run.\n"
-            "- Treat this as **triage**, not a decision—use it to shape questions."
+            "- **Score (out of 35):** 7 founder signals × up to 5 points each. This is the headline score.\n"
+            "- **Bonus (0–5):** shown separately for standout traits from public sources "
+            "(e.g., repeat founder, strong technical background, fast product cadence). **Not added** to the headline.\n"
+            "- **Coverage:** % of signals with **score > 0** (evidence-based).\n"
+            "- If you want a combined view, mentally add Score + Bonus (max 40), but we report /35 to avoid over-weighting sparse traits."
         )
 
     # Raw scoring UI (original panel) behind details
