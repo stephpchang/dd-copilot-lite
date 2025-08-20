@@ -1,5 +1,6 @@
 # app/founder_scoring.py
 # Founder Potential panel — headline /35, bonus separate, coverage = score>0, no integrity floor.
+# Adds: signal definitions + table view + per-signal relevant sources list.
 # Directional triage aid; not a decision.
 
 from __future__ import annotations
@@ -18,6 +19,27 @@ SEVEN_SIGNALS = [
     "Learning speed",
     "Integrity",
 ]
+
+SIGNAL_DEFINITIONS: Dict[str, str] = {
+    "Domain insight": "Founder’s depth in the problem space (prior work, writing, clarity of thesis).",
+    "Execution": "Ability to ship and improve (changelogs, launches, docs, momentum).",
+    "Hiring pull": "Ability to attract talent (team signals, active hiring).",
+    "Communication": "Clarity + public communication (writing, talks, press).",
+    "Customer focus": "Evidence of customer proof points (reviews, case studies, docs).",
+    "Learning speed": "Cadence of iteration (visible updates, experiments, roadmaps).",
+    "Integrity": "Basic trust signals (verified profiles, transparent practices).",
+}
+
+# Heuristic URL filters to surface *relevant* sources per signal in the breakdown
+SIGNAL_SOURCE_FILTERS: Dict[str, List[str]] = {
+    "Domain insight": ["wikipedia.org", "substack.com", "medium.com", "github.com", "readthedocs", "blog"],
+    "Execution": ["github.com", "docs.", "changelog", "release", "producthunt.com", "notion.site", "roadmap"],
+    "Hiring pull": ["linkedin.com/in", "jobs", "greenhouse.io", "lever.co", "careers"],
+    "Communication": ["substack.com", "medium.com", "mirror.xyz", "twitter.com", "x.com", "press", "techcrunch.com"],
+    "Customer focus": ["g2.com", "capterra.com", "case", "customers", "case-study", "docs."],
+    "Learning speed": ["changelog", "release notes", "github.com", "notion.site", "trello"],
+    "Integrity": ["wikipedia.org", "crunchbase.com", "linkedin.com", "open source", "license"],
+}
 
 def _domain(u: str) -> str:
     try:
@@ -146,6 +168,20 @@ def _bonus_and_traits(wiki_summary: str, founder_hint: str | None, sources_list:
 
     return min(bonus, 5), traits
 
+def _relevant_domains_for_signal(sig: str, sources_list: List[str]) -> List[str]:
+    needles = [n.lower() for n in SIGNAL_SOURCE_FILTERS.get(sig, [])]
+    hits = []
+    for u in (sources_list or []):
+        ul = (u or "").lower()
+        if any(n in ul for n in needles):
+            hits.append(_domain(u))
+    # Dedup while keeping order
+    seen = set(); out = []
+    for d in hits:
+        if d and d not in seen:
+            seen.add(d); out.append(d)
+    return out[:6]
+
 def auto_founder_scoring_panel(
     company_name: str,
     founder_hint: str | None,
@@ -193,13 +229,44 @@ def auto_founder_scoring_panel(
     else:
         st.caption("Standout traits (public): none detected")
 
-    # Breakdown
-    with st.expander("Per-signal breakdown", expanded=False):
+    # --- New: tabular breakdown with brief descriptions and top sources ---
+    rows = []
+    for sig in SEVEN_SIGNALS:
+        row = per_signal[sig]
+        short_ev = " | ".join(row["evidence"][:2]) if row["evidence"] else "—"
+        srcs = _relevant_domains_for_signal(sig, sources_list)
+        src_badges = " ".join(
+            f"<span style='background:#f1f5f9;border:1px solid #e2e8f0;border-radius:999px;"
+            f"padding:2px 8px;font-size:11px;color:#334155'>{html.escape(d)}</span>"
+            for d in srcs
+        )
+        rows.append({
+            "Signal": sig,
+            "What it means": SIGNAL_DEFINITIONS.get(sig, ""),
+            "Score (0–5)": row["score"],
+            "Why we gave this score": short_ev,
+            "Top sources": src_badges or "—",
+        })
+    st.markdown("#### Per-signal breakdown (skim)")
+    # Render as table; allow HTML in Top sources via unsafe markdown below each row
+    # Use st.table for the main columns except sources, then render sources underneath
+    st.table([{k: (v if k != "Top sources" else "") for k, v in r.items()} for r in rows])
+    # print sources line-by-line to keep badges
+    for r in rows:
+        if r["Top sources"]:
+            st.markdown(f"*{r['Signal']} — top sources:* {r['Top sources']}", unsafe_allow_html=True)
+
+    # Full evidence (optional)
+    with st.expander("See full evidence per signal"):
         for sig in SEVEN_SIGNALS:
             row = per_signal[sig]
-            st.write(f"- **{sig}:** {row['score']} / 5")
-            for ev in row["evidence"]:
-                st.write(f"   • {ev}")
+            st.markdown(f"**{sig}** — {SIGNAL_DEFINITIONS[sig]}")
+            st.write(f"Score: {row['score']} / 5")
+            if row["evidence"]:
+                for ev in row["evidence"]:
+                    st.write(f"• {ev}")
+            else:
+                st.caption("No specific evidence captured for this signal.")
 
     # (Optional) return structure for future use
     return {
