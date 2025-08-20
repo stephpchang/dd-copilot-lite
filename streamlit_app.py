@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Due Diligence Co-Pilot (Lite)
-# v0.13.2 — Founder Brief tabs (no jump); “Standout” wording; tighter founder detection
+# v0.13.3 — fix: serp() DuckDuckGo fallback indentation; Founder Brief tabs; “Standout” wording; tighter founder detection
 
 import os
 import re
@@ -40,7 +40,7 @@ st.markdown(
 )
 st.title("Due Diligence Co-Pilot (Lite)")
 st.caption(f"OpenAI key loaded: {'yes' if os.getenv('OPENAI_API_KEY') else 'no'}")
-st.caption("Build: v0.13.2 — Founder Brief tabs (no jump); “Standout” wording; tighter founder detection")
+st.caption("Build: v0.13.3 — fix: DuckDuckGo indent; tabs for Founder Brief; “Standout” wording; tighter founder detection")
 
 # ===============================================================
 # SEARCH: Google CSE (preferred) → DuckDuckGo HTML (fallback)
@@ -98,7 +98,7 @@ def serp(query: str, num: int = 3):
             except Exception:
                 pass
 
-        title = html.unescape(re.sub("<.*?>", "", title_html)).strip()
+            title = html.unescape(re.sub("<.*?>", "", title_html)).strip()
             snippet = ""
             if i < len(snips):
                 snippet = html.unescape(re.sub("<.*?>", "", snips[i])).strip()
