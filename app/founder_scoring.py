@@ -1,5 +1,5 @@
 # app/founder_scoring.py
-# Founder Potential — LLM-driven rubric with 7 original signals (base /35, bonus separate).
+# Founder Potential — LLM-driven rubric with 7 original signals (base /35, standout bonus separate).
 # Signals:
 #   DD  = Domain Depth
 #   UJ  = Unconventional / Rigorous Journey
@@ -9,11 +9,11 @@
 #   NC  = Narrative Control
 #   TLI = Technology Literacy + Imagination
 #
-# What changed:
-# - Restored your original 7 traits and labels verbatim
-# - Headline score is BASE ONLY (/35). Spike bonus is tracked and shown separately
-# - Clear per-trait table (no index), brief definitions, and full evidence expander
-# - Banding kept: Strong / Moderate / Weak
+# What changed in this version:
+# - Renames UI wording from "Spike" → "Standout" (clearer to non-technical users).
+# - Headline score is BASE ONLY (/35). Standout bonus is shown separately.
+# - Per-trait table is clean (no index) with short trait definitions.
+# - Banding unchanged: Strong / Moderate / Weak.
 
 from __future__ import annotations
 
@@ -41,7 +41,6 @@ TRAITS: List[Tuple[str, str]] = [
     ("TLI", "Technology Literacy + Imagination"),
 ]
 
-# Short definitions shown in table
 TRAIT_DEFS: Dict[str, str] = {
     "Domain Depth": "Relevant experience & clarity in the problem space.",
     "Unconventional / Rigorous Journey": "Evidence of grit via non-linear or demanding paths.",
@@ -52,7 +51,7 @@ TRAIT_DEFS: Dict[str, str] = {
     "Technology Literacy + Imagination": "Comfort with tech and creative application.",
 }
 
-SPIKE_MULTIPLIER = 1.5  # used to compute BONUS only (headline stays base)
+STANDOUT_MULTIPLIER = 1.5  # used to compute BONUS only (headline stays base)
 BANDS = {
     "strong":   {"min": 26.0, "max": 35.0, "label": "Strong Signal",
                  "explain": "Likely **Bring to Partner**. Early traits align with USV Core pre-PMF winners."},
@@ -80,7 +79,7 @@ def _auto_schema() -> dict:
                     "key":   {"type": "string", "enum": valid_keys},
                     "label": {"type": "string", "enum": valid_labels},
                     "score": {"type": "integer", "minimum": 1, "maximum": 5},
-                    "spike": {"type": "boolean"},
+                    "spike": {"type": "boolean"},  # keep JSON key as 'spike' for compatibility
                     "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
                 },
                 "required": ["key", "label", "score", "spike", "evidence"],
@@ -132,7 +131,7 @@ Score each trait 1–5 (5 is best). Be conservative when evidence is thin:
 - VWC: progress with very little spend.
 - NC: frames and owns the narrative credibly.
 - TLI: deep technical literacy and imaginative use.
-Mark "spike": true ONLY if evidence is clearly exceptional for seed/Series A.
+Mark "spike": true ONLY if evidence is clearly exceptional for seed/Series A (we'll label it "Standout" in the UI).
 """
 
     return f"""
@@ -172,8 +171,8 @@ Return ONLY the JSON object.
 
 @dataclass
 class ScorePack:
-    base_total: float    # headline /35 (no spike multiplier)
-    bonus: float         # added visibility from spiking traits
+    base_total: float    # headline /35 (no multiplier)
+    bonus: float         # visibility from 'standout' traits
     max_base: float
     band_key: str
     band_label: str
@@ -188,7 +187,7 @@ def _band_for(base_total: float) -> Tuple[str, str, str]:
             BANDS["strong" if base_total > 35 else "weak"]["explain"])
 
 def _score_from_traits(traits: List[dict]) -> ScorePack:
-    """Headline score is BASE ONLY. Bonus is computed from spiking traits."""
+    """Headline score is BASE ONLY. 'Standout' bonus is computed from spiking traits."""
     max_base = 5.0 * len(TRAITS)  # 35
     base = 0.0
     bonus = 0.0
@@ -196,7 +195,7 @@ def _score_from_traits(traits: List[dict]) -> ScorePack:
         s = float(t.get("score", 1))
         base += s
         if t.get("spike"):
-            bonus += s * (SPIKE_MULTIPLIER - 1.0)
+            bonus += s * (STANDOUT_MULTIPLIER - 1.0)
     base = min(round(base, 1), 35.0)
     bonus = round(bonus, 1)
     band_key, band_label, band_explain = _band_for(base)
@@ -237,18 +236,18 @@ def auto_founder_scoring_panel(
 
     pack = _score_from_traits(traits)
 
-    # Header: founders + spikes
+    # Header: founders + standout chips
     headline = ", ".join(founder_names) if founder_names else "Founder(s): not detected"
     st.markdown(f"**{headline}**")
 
-    spiking = [t for t in traits if t.get("spike")]
-    st.caption("Spiking traits: " + (" ".join(f"`{t.get('label','?')}`" for t in spiking) if spiking else "none detected"))
+    standout = [t for t in traits if t.get("spike")]
+    st.caption("Standout signals (exceptional for stage): " + (" ".join(f"`{t.get('label','?')}`" for t in standout) if standout else "none"))
 
     # Score cards
     c1, c2, c3 = st.columns(3)
     c1.metric("Score (out of 35)", f"{pack.base_total}")
     c2.metric("Coverage", f"{coverage}%")
-    c3.metric("Spike bonus (separate)", f"+{pack.bonus}")
+    c3.metric("Standout bonus (separate)", f"+{pack.bonus}")
 
     # Band explanation
     st.info(f"**{pack.band_label}** — {pack.band_explain}")
@@ -261,7 +260,7 @@ def auto_founder_scoring_panel(
             "Trait": label,
             "What it means": TRAIT_DEFS.get(label, ""),
             "Score (0–5)": t.get("score", ""),
-            "Spike?": "Yes" if t.get("spike") else "No",
+            "Standout?": "Yes" if t.get("spike") else "No",
             "Why we gave this score": " | ".join((t.get("evidence") or [])[:3]) or "—",
         })
 
@@ -276,7 +275,7 @@ def auto_founder_scoring_panel(
         for t in traits:
             label = t.get("label", "?")
             st.markdown(f"**{label}** — {TRAIT_DEFS.get(label, '')}")
-            st.write(f"Score: {t.get('score','?')} / 5" + ("  ·  **Spike**" if t.get("spike") else ""))
+            st.write(f"Score: {t.get('score','?')} / 5" + ("  ·  **Standout**" if t.get("spike") else ""))
             for e in (t.get("evidence") or []):
                 st.write(f"- {e}")
 
@@ -294,7 +293,7 @@ def auto_founder_scoring_panel(
         st.write("- **Strong Signal (26–35):** Bring to Partner likely.")
         st.write("- **Moderate Signal (18–25.9):** Promising; needs more evidence.")
         st.write("- **Weak Signal (<18):** Probably pass for now unless there’s a compelling wedge.")
-        st.write(f"**Spike weighting:** shown separately (×{SPIKE_MULTIPLIER} on spiking traits).")
+        st.write(f"**Standout weighting:** shown separately (×{STANDOUT_MULTIPLIER} on standout traits).")
 
     if flags:
         with st.expander("Auto-detected flags / caveats"):
